@@ -23,4 +23,5 @@ qwen
 qwenpaw
 reasonix
 traecli
+workbuddy
 zeroclaw

@@ -231,6 +231,24 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 		modelEnv := desc.EnvPrefix + "_MODEL"
 		if e, ok := probe(pathEnv, desc.DefaultCommand, modelEnv); ok {
 			agents[desc.ID] = e
+			continue
+		}
+		// A desktop app that bundles its CLI inside the app bundle instead of
+		// putting it on PATH needs an explicit fallback here — the login-shell
+		// resolver cannot know app-internal paths. Same pattern as the bundled
+		// codex/dsh CLIs above: only when no explicit MULTICA_*_PATH override
+		// is set, and only while the candidate is executable.
+		if desc.ID == "workbuddy" && strings.TrimSpace(os.Getenv(pathEnv)) == "" {
+			for _, p := range workbuddyDesktopAppBundlePaths() {
+				if executableCandidate(p) {
+					agents[desc.ID] = AgentEntry{
+						Path:    p,
+						Command: desc.DefaultCommand,
+						Model:   strings.TrimSpace(os.Getenv(modelEnv)),
+					}
+					break
+				}
+			}
 		}
 	}
 	if e, ok := probe("MULTICA_CURSOR_PATH", "cursor-agent", "MULTICA_CURSOR_MODEL"); ok {
@@ -261,6 +279,24 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 	}
 	if e, ok := probe("MULTICA_CODEBUDDY_PATH", "codebuddy", "MULTICA_CODEBUDDY_MODEL"); ok {
 		agents["codebuddy"] = e
+	} else if strings.TrimSpace(os.Getenv("MULTICA_CODEBUDDY_PATH")) == "" {
+		// WorkBuddy Desktop ships a CodeBuddy-compatible CLI inside its app
+		// bundle instead of installing `codebuddy` onto PATH, and no login
+		// shell rc knows that path. When no separate CodeBuddy CLI exists,
+		// the bundled binary backs the codebuddy family — including custom
+		// runtime profiles (e.g. "WorkBuddy (CodeBuddy)") whose command_name
+		// misses PATH but whose runtimeType resolves through the discovered
+		// provider command in appendProfileRuntimes.
+		for _, p := range workbuddyDesktopAppBundlePaths() {
+			if executableCandidate(p) {
+				agents["codebuddy"] = AgentEntry{
+					Path:    p,
+					Command: "codebuddy",
+					Model:   strings.TrimSpace(os.Getenv("MULTICA_CODEBUDDY_MODEL")),
+				}
+				break
+			}
+		}
 	}
 	// agy 1.0.6 added a `--model` flag (MUL-3125), so Antigravity now takes a
 	// model env like every other backend. MULTICA_ANTIGRAVITY_MODEL seeds the

@@ -265,7 +265,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// can re-run the same discovery on a live daemon (MUL-5439).
 	agents := probeAgentCLIs()
 	if len(agents) == 0 && !overrides.AllowNoAgents {
-		return Config{}, fmt.Errorf("no agent CLI found: install claude, codebuddy, codearts, codex, copilot, opencode, deveco, openclaw, hermes, pi, omp, cursor-agent, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, or zeroclaw and ensure it is on PATH")
+		return Config{}, fmt.Errorf("no agent CLI found: install claude, codebuddy, codearts, codex, copilot, opencode, deveco, openclaw, hermes, pi, omp, cursor-agent, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw and ensure it is on PATH")
 	}
 
 	claudeArgs, err := shellArgsFromEnv("MULTICA_CLAUDE_ARGS")
@@ -992,6 +992,24 @@ var codexDesktopAppBundlePaths = func() []string {
 			filepath.Join(home, "Applications", "ChatGPT.app", "Contents", "Resources", "codex"),
 			filepath.Join(home, "Applications", "Codex.app", "Contents", "Resources", "codex"),
 		)
+	}
+	return paths
+}
+
+// workbuddyDesktopAppBundlePaths returns candidate macOS app-bundle locations
+// for the CodeBuddy-compatible CLI bundled inside Tencent's WorkBuddy desktop
+// app. The app does not install the CLI onto PATH, so discovery falls back to
+// these candidates (same pattern as the bundled Codex CLI). Candidates are
+// ordered system /Applications before user ~/Applications. On other platforms
+// (e.g. Windows) the CLI is reachable only via MULTICA_WORKBUDDY_PATH /
+// MULTICA_CODEBUDDY_PATH.
+var workbuddyDesktopAppBundlePaths = func() []string {
+	rel := filepath.Join("Contents", "Resources", "app.asar.unpacked", "cli", "bin", "codebuddy")
+	paths := []string{
+		filepath.Join("/Applications", "WorkBuddy.app", rel),
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, "Applications", "WorkBuddy.app", rel))
 	}
 	return paths
 }

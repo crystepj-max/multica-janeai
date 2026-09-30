@@ -19,6 +19,41 @@ import (
 // and runContext for zero-timeout = no-deadline semantics.
 type codebuddyBackend struct {
 	cfg Config
+
+	// defaultExecutable and providerLabel let built-in runtime identities
+	// (e.g. "workbuddy", a CodeBuddy-compatible CLI shipped inside the
+	// WorkBuddy desktop app) reuse this backend under their own command name
+	// and log label. Zero values keep the stock "codebuddy" behavior.
+	defaultExecutable string
+	providerLabel     string
+}
+
+// applyBuiltinRuntimeOverrides implements backendOverrideApplicator so
+// NewRuntime can host CodeBuddy-family runtime identities.
+func (b *codebuddyBackend) applyBuiltinRuntimeOverrides(desc BuiltinRuntime) {
+	if desc.DefaultExecutable != "" {
+		b.defaultExecutable = desc.DefaultExecutable
+	}
+	if desc.ProviderLabel != "" {
+		b.providerLabel = desc.ProviderLabel
+	}
+}
+
+// executableName returns the CLI to launch: the runtime identity's override
+// when set, otherwise the stock codebuddy command.
+func (b *codebuddyBackend) executableName() string {
+	if b.defaultExecutable != "" {
+		return b.defaultExecutable
+	}
+	return "codebuddy"
+}
+
+// label returns the provider label for log and error messages.
+func (b *codebuddyBackend) label() string {
+	if b.providerLabel != "" {
+		return b.providerLabel
+	}
+	return "codebuddy"
 }
 
 // codebuddyBlockedArgs are flags hardcoded by the daemon that must not be
@@ -96,10 +131,10 @@ func buildCodebuddyArgs(opts ExecOptions, logger *slog.Logger) []string {
 func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
 	execPath := b.cfg.ExecutablePath
 	if execPath == "" {
-		execPath = "codebuddy"
+		execPath = b.executableName()
 	}
 	if _, err := exec.LookPath(execPath); err != nil {
-		return nil, fmt.Errorf("codebuddy executable not found at %q: %w", execPath, err)
+		return nil, fmt.Errorf("%s executable not found at %q: %w", b.label(), execPath, err)
 	}
 
 	timeout := opts.Timeout
@@ -161,7 +196,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 	var closeStdinOnce sync.Once
 	closeStdin := func() { closeStdinOnce.Do(func() { _ = stdin.Close() }) }
 
-	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[codebuddy:stderr] "), agentStderrTailBytes)
+	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "["+b.label()+":stderr] "), agentStderrTailBytes)
 	cmd.Stderr = stderrBuf
 
 	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
@@ -170,7 +205,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 		return nil, fmt.Errorf("start codebuddy: %w", err)
 	}
 
-	b.cfg.Logger.Info("codebuddy started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info(b.label()+" started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
 
 	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
 	mcpFileCleanup = nil
@@ -305,7 +340,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 			completionGuardError = "codebuddy emitted a background task system event; Multica-managed runs require foreground execution (set CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS=1)"
 		}
 		finalStatus, finalOutput, finalError := finalizeStreamResult(
-			"codebuddy",
+			b.label(),
 			timeout,
 			runCtx.Err(),
 			writeErr,
@@ -325,10 +360,10 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 		// rejection phrases often land only on stderr (mirror Claude MUL-4966).
 		stderrTail := stderrBuf.Tail()
 		if finalError != "" {
-			finalError = withAgentStderr(finalError, "codebuddy", stderrTail)
+			finalError = withAgentStderr(finalError, b.label(), stderrTail)
 		}
 		logStreamProtocolObservation(b.cfg.Logger, streamProtocolObservation{
-			provider:                   "codebuddy",
+			provider:                   b.label(),
 			cliVersion:                 b.cfg.CLIVersion,
 			model:                      opts.Model,
 			exitCode:                   streamProcessExitCode(exitErr),
@@ -345,7 +380,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 			anthropicBaseURLConfigured: strings.TrimSpace(b.cfg.Env["ANTHROPIC_BASE_URL"]) != "",
 		})
 
-		b.cfg.Logger.Info("codebuddy finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
+		b.cfg.Logger.Info(b.label()+" finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
 		resumeRejected := resumeWasRejected(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError, stderrTail)
 		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError, stderrTail)
