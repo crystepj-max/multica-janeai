@@ -25,3 +25,4 @@ reasonix
 traecli
 workbuddy
 zeroclaw
+zcode

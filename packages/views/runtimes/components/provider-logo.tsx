@@ -4,6 +4,7 @@ import codeartsLogo from "./codearts-logo.svg";
 import qwenLogo from "./qwen-logo.svg";
 import reasonixLogo from "./reasonix-logo.svg";
 import dimLogo from "./dim-logo.png";
+import zcodeLogo from "./zcode-logo.png";
 
 // Next.js exposes static imports as objects while Vite exposes URL strings.
 // Normalize both shapes here so shared provider logos work in web and desktop.
@@ -354,6 +355,13 @@ function DimLogo({ className }: { className: string }) {
   return <img src={staticAssetSrc(dimLogo)} alt="" aria-hidden className={className} />;
 }
 
+// ZCode (Z.AI) — official app icon extracted from the ZCode Desktop app bundle
+// (ZCode.app/Contents/Resources/icon.icns), resized to 128px for crisp
+// rendering at small sizes. Same <img> pattern as DimLogo.
+function ZcodeLogo({ className }: { className: string }) {
+  return <img src={staticAssetSrc(zcodeLogo)} alt="" aria-hidden className={className} />;
+}
+
 // ZeroClaw — no official brand asset has been sourced for this runtime yet
 // (multica-ai/multica#1543), so this is a deliberately simple placeholder
 // mark (three claw-scratch strokes) rather than a claimed "official" logo.
@@ -435,6 +443,8 @@ export function ProviderLogo({
       return <DimLogo className={className} />;
     case "zeroclaw":
       return <ZeroClawLogo className={className} />;
+    case "zcode":
+      return <ZcodeLogo className={className} />;
     default:
       return <Monitor className={className} />;
   }

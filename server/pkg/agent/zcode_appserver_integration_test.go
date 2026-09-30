@@ -1,0 +1,216 @@
+//go:build agentintegration
+
+package agent
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// resolveZcodeSmokeExecutable locates a runnable zcode for the real-binary
+// smoke test. It prefers MULTICA_ZCODE_PATH, then `zcode` on PATH, then the
+// CLI bundled inside the ZCode Desktop app.
+func resolveZcodeSmokeExecutable(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("MULTICA_ZCODE_PATH"); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		t.Fatalf("MULTICA_ZCODE_PATH=%s does not exist", p)
+	}
+	if p, err := exec.LookPath("zcode"); err == nil {
+		return p
+	}
+	for _, p := range zcodeDesktopAppBundlePaths() {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	t.Skip("no zcode executable found; skipping real-binary smoke test")
+	return ""
+}
+
+// TestZcodeRealAppServerSmoke drives the real `zcode app-server` runtime
+// end-to-end: session/create → subscribe → send → consume events → close.
+func TestZcodeRealAppServerSmoke(t *testing.T) {
+	requireRealAgentSmoke(t)
+	if testing.Short() {
+		t.Skip("skipping real-binary smoke test in -short mode")
+	}
+	path := resolveZcodeSmokeExecutable(t)
+	if version, err := exec.Command(path, "--version").CombinedOutput(); err == nil {
+		t.Logf("zcode CLI version: %s", strings.TrimSpace(string(version)))
+	}
+
+	runtimeID := fmt.Sprintf("rt-zcode-smoke-%d", time.Now().UnixNano())
+	backend, err := New("zcode", Config{ExecutablePath: path, Logger: slog.Default(), RuntimeID: runtimeID})
+	if err != nil {
+		t.Fatalf("new zcode backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	workdir := t.TempDir()
+	session, err := backend.Execute(ctx, "Reply with exactly one word: pong. Do not use any tools.", ExecOptions{
+		Cwd:                       workdir,
+		Timeout:                   100 * time.Second,
+		HandshakeTimeout:          30 * time.Second,
+		SemanticInactivityTimeout: 90 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for msg := range session.Messages {
+			t.Logf("zcode msg: type=%s tool=%s content=%q", msg.Type, msg.Tool, truncateForLogf(msg.Content))
+		}
+	}()
+
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("real zcode run did not complete: status=%q error=%q", result.Status, result.Error)
+		}
+		if !strings.Contains(strings.ToLower(result.Output), "pong") {
+			t.Fatalf("expected real zcode output to contain 'pong', got %q", result.Output)
+		}
+		if result.SessionID == "" {
+			t.Error("expected a non-empty session id from real zcode")
+		}
+		t.Logf("real zcode smoke OK: session=%s output=%q usage=%v", result.SessionID, result.Output, result.Usage)
+
+		// Second turn asks to resume the prior session, but each Execute owns
+		// a fresh app-server process (per-task MULTICA_TOKEN scoping) and ZCode
+		// sessions are process-memory-only — so the resume deterministically
+		// falls back to a fresh session with the continuity notice. Pin that
+		// degradation instead of the old shared-process resume.
+		freshSession := runZcodeFollowUpTurn(t, backend, result.SessionID, workdir)
+		t.Logf("real zcode follow-up OK: fresh_session=%s", freshSession)
+
+		// Third turn drives a real tool call: tool.updated phases must
+		// surface as a matched tool_use/tool_result pair on the message
+		// stream (the daemon's in-flight tool window counts on them).
+		runZcodeToolTurn(t, backend, freshSession, workdir)
+	case <-time.After(120 * time.Second):
+		t.Fatal("timeout waiting for real zcode result")
+	}
+}
+
+// runZcodeFollowUpTurn executes a follow-up turn that asks to resume
+// sessionID. Because each Execute owns a fresh app-server process and ZCode
+// sessions are process-memory-only, the resume fails and the turn runs on a
+// fresh session. It returns that fresh session id.
+func runZcodeFollowUpTurn(t *testing.T, backend Backend, sessionID, workdir string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "What did I ask you for? Reply with one word.", ExecOptions{
+		Cwd:                    workdir,
+		Timeout:                50 * time.Second,
+		HandshakeTimeout:       20 * time.Second,
+		ResumeSessionID:        sessionID,
+		ResumeExpected:         true,
+		ResumeContinuityNotice: "[continuity lost] ",
+	})
+	if err != nil {
+		t.Fatalf("follow-up execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("follow-up turn did not complete: status=%q error=%q", result.Status, result.Error)
+		}
+		if result.SessionID == sessionID {
+			t.Fatalf("follow-up turn resumed memory-only session %q across processes; expected a fresh-session fallback", sessionID)
+		}
+		t.Logf("follow-up output=%q", result.Output)
+		return result.SessionID
+	case <-time.After(60 * time.Second):
+		t.Fatal("timeout waiting for follow-up result")
+		return ""
+	}
+}
+
+// runZcodeToolTurn executes a turn that forces a tool call and asserts the
+// tool.updated lifecycle reached the message stream as a matched
+// tool_use/tool_result pair. Returns after the message channel closed, so the
+// assertions see every message of the turn.
+func runZcodeToolTurn(t *testing.T, backend Backend, sessionID, workdir string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "Run the shell command `echo zcode-tool-smoke-ok` using a tool, then reply with its exact output.", ExecOptions{
+		Cwd:                       workdir,
+		Timeout:                   80 * time.Second,
+		HandshakeTimeout:          20 * time.Second,
+		SemanticInactivityTimeout: 60 * time.Second,
+		ResumeSessionID:           sessionID,
+	})
+	if err != nil {
+		t.Fatalf("tool execute: %v", err)
+	}
+	seen := map[MessageType][]Message{}
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for msg := range session.Messages {
+			seen[msg.Type] = append(seen[msg.Type], msg)
+		}
+	}()
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		<-drained
+		if result.Status != "completed" {
+			t.Fatalf("tool turn did not complete: status=%q error=%q", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Output, "zcode-tool-smoke-ok") {
+			t.Fatalf("expected tool output in response, got %q", result.Output)
+		}
+		uses := seen[MessageToolUse]
+		results := seen[MessageToolResult]
+		if len(uses) == 0 {
+			t.Fatal("no tool_use message observed on a tool-forcing turn")
+		}
+		if len(results) < len(uses) {
+			t.Fatalf("tool_use/tool_result unbalanced: %d uses vs %d results", len(uses), len(results))
+		}
+		byCallID := map[string]Message{}
+		for _, m := range uses {
+			byCallID[m.CallID] = m
+		}
+		for _, m := range results {
+			use, ok := byCallID[m.CallID]
+			if !ok {
+				t.Errorf("tool_result for unknown call %q", m.CallID)
+				continue
+			}
+			if m.Tool == "" || m.Tool != use.Tool {
+				t.Errorf("tool_result %q tool=%q does not match its tool_use tool=%q", m.CallID, m.Tool, use.Tool)
+			}
+		}
+		t.Logf("tool turn OK: %d tool_use, %d tool_result (first: %s)", len(uses), len(results), uses[0].Tool)
+	case <-time.After(90 * time.Second):
+		t.Fatal("timeout waiting for tool turn result")
+	}
+}
+
+func truncateForLogf(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "…"
+	}
+	return s
+}

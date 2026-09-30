@@ -172,6 +172,22 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 				}
 			}
 		}
+		if defaultCmd == "zcode" && cmd == defaultCmd {
+			// ZCode Desktop bundles its CLI inside the macOS app instead of
+			// installing `zcode` onto PATH, and the login-shell fallback
+			// above cannot rescue it: no rc file knows that path. Like the
+			// dsh candidate this is a Node script run through its shebang,
+			// so it only counts while it is executable.
+			for _, p := range zcodeDesktopAppBundlePaths() {
+				if executableCandidate(p) {
+					return AgentEntry{
+						Path:    p,
+						Command: cmd,
+						Model:   strings.TrimSpace(os.Getenv(modelEnv)),
+					}, true
+				}
+			}
+		}
 		return AgentEntry{}, false
 	}
 
@@ -366,6 +382,16 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 	// advertise a knob that silently does nothing.
 	if e, ok := probe("MULTICA_ZEROCLAW_PATH", "zeroclaw", ""); ok {
 		agents["zeroclaw"] = e
+	}
+	// ZCode (`zcode`) is the CLI bundled with the ZCode Desktop app, driven
+	// headlessly via the native `zcode app-server` JSON-RPC session protocol
+	// (see server/pkg/agent/zcode_appserver.go). Discovery probes any zcode
+	// the same way as every other CLI (PATH lookup + --version). It takes no
+	// model env var: the catalog comes from the runtime's personal provider
+	// store (see discoverZcodeRuntimeModels), and a pinned agent model is
+	// applied via session/setModel.
+	if e, ok := probe("MULTICA_ZCODE_PATH", "zcode", ""); ok {
+		agents["zcode"] = e
 	}
 	return agents
 }
