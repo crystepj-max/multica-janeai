@@ -97,6 +97,25 @@ var BuiltinRuntimes = []BuiltinRuntime{
 		ProviderLabel:     "omp",
 		ModelDiscovery:    discoverOmpModels,
 	},
+	{
+		// WorkBuddy is Tencent's WorkBuddy desktop app, whose bundled CLI is a
+		// CodeBuddy Code fork speaking the same stream-json protocol. The CLI
+		// is not installed onto PATH by the app, so the daemon additionally
+		// discovers it inside the app bundle (agents_probe.go). Its config
+		// root is ~/.codebuddy (the bundled CLI keeps the fork's native
+		// directory), so user-level skills resolve there.
+		ID:                "workbuddy",
+		ProtocolFamily:    "codebuddy",
+		DefaultCommand:    "workbuddy",
+		EnvPrefix:         "MULTICA_WORKBUDDY",
+		DisplayName:       "WorkBuddy",
+		SkillsDir:         ".codebuddy/skills",
+		UserSkillsDir:     ".codebuddy/skills",
+		LaunchHeader:      "workbuddy (stream-json)",
+		DefaultExecutable: "workbuddy",
+		ProviderLabel:     "workbuddy",
+		ModelDiscovery:    discoverWorkbuddyModels,
+	},
 }
 
 // BuiltinRuntimeByID returns the descriptor for the given runtime identity,

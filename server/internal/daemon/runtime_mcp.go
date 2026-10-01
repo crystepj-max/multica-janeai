@@ -399,7 +399,9 @@ func listRuntimeLocalMcpServers(provider string) ([]runtimeLocalMcpServerSummary
 		path, key, source, format = filepath.Join(home, ".claude.json"), "mcpServers", "User config", "json"
 	case "codearts":
 		path, key, source, format = codeArtsUserConfigPath(home), "mcp", "User config", "jsonc"
-	case "codebuddy":
+	case "codebuddy", "workbuddy":
+		// workbuddy is the WorkBuddy desktop app's bundled CodeBuddy fork; it
+		// keeps the fork's native ~/.codebuddy config root.
 		path, key, source, format = codebuddyUserMcpConfigPath(home), "mcpServers", "User config", "jsonc"
 	case "kimi":
 		// Inventory only — kimi is deliberately absent from

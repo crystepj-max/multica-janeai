@@ -6476,6 +6476,7 @@ var runtimeDisplayNameOverrides = map[string]string{
 	"qwenpaw":    "QwenPaw",
 	"mcode":      "MiniMax Code",
 	"zeroclaw":   "ZeroClaw",
+	"zcode":      "ZCode",
 }
 
 func init() {
@@ -10618,7 +10619,9 @@ func defaultArgsForProvider(cfg Config, provider string) []string {
 		args = cfg.ClaudeArgs
 	case "codex":
 		args = cfg.CodexArgs
-	case "codebuddy":
+	case "codebuddy", "workbuddy":
+		// workbuddy reuses the CodeBuddy family's extra args; no separate
+		// MULTICA_WORKBUDDY_ARGS knob exists.
 		args = cfg.CodebuddyArgs
 	case "qwen":
 		args = cfg.QwenArgs

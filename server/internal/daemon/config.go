@@ -110,7 +110,7 @@ type Config struct {
 	CLIVersion                     string                // multica CLI version (e.g. "0.1.13")
 	LaunchedBy                     string                // "desktop" when spawned by the Electron app, empty for standalone
 	Profile                        string                // profile name (empty = default)
-	Agents                         map[string]AgentEntry // keyed by provider: claude, codebuddy, codex, copilot, opencode, codearts, deveco, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro, antigravity, qoder, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw (plus built-in runtime identities from agent.BuiltinRuntimes, e.g. omp)
+	Agents                         map[string]AgentEntry // keyed by provider: claude, codebuddy, codex, copilot, opencode, codearts, deveco, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro, antigravity, qoder, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw, zcode (plus built-in runtime identities from agent.BuiltinRuntimes, e.g. omp)
 	WorkspacesRoot                 string                // base path for execution envs (default: ~/multica_workspaces)
 	KeepEnvAfterTask               bool                  // preserve env after task for debugging
 	HealthPort                     int                   // local HTTP port for health checks (default: 19514)
@@ -265,7 +265,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// can re-run the same discovery on a live daemon (MUL-5439).
 	agents := probeAgentCLIs()
 	if len(agents) == 0 && !overrides.AllowNoAgents {
-		return Config{}, fmt.Errorf("no agent CLI found: install claude, codebuddy, codearts, codex, copilot, opencode, deveco, openclaw, hermes, pi, omp, cursor-agent, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, or zeroclaw and ensure it is on PATH")
+		return Config{}, fmt.Errorf("no agent CLI found: install claude, codebuddy, codearts, codex, copilot, opencode, deveco, openclaw, hermes, pi, omp, cursor-agent, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw, or zcode and ensure it is on PATH")
 	}
 
 	claudeArgs, err := shellArgsFromEnv("MULTICA_CLAUDE_ARGS")
@@ -973,7 +973,7 @@ func isExecutableFile(path string) bool {
 // doesn't require editing this list by hand.
 var defaultAgentCommandNames = append([]string{
 	"claude", "codex", "opencode", "codearts", "deveco", "openclaw", "hermes",
-	"pi", "cursor-agent", "copilot", "kimi", "reasonix", "dsh", "kiro-cli", "codebuddy", "agy", "qodercli", "qoderclicn", "traecli", "grok", "qwen", "qwenpaw", "mcode", "dim", "zeroclaw",
+	"pi", "cursor-agent", "copilot", "kimi", "reasonix", "dsh", "kiro-cli", "codebuddy", "agy", "qodercli", "qoderclicn", "traecli", "grok", "qwen", "qwenpaw", "mcode", "dim", "zeroclaw", "zcode",
 }, agent.BuiltinRuntimeCommands()...)
 
 // codexDesktopAppBundlePaths returns candidate macOS app-bundle locations for
@@ -991,6 +991,41 @@ var codexDesktopAppBundlePaths = func() []string {
 		paths = append(paths,
 			filepath.Join(home, "Applications", "ChatGPT.app", "Contents", "Resources", "codex"),
 			filepath.Join(home, "Applications", "Codex.app", "Contents", "Resources", "codex"),
+		)
+	}
+	return paths
+}
+
+// workbuddyDesktopAppBundlePaths returns candidate macOS app-bundle locations
+// for the CodeBuddy-compatible CLI bundled inside Tencent's WorkBuddy desktop
+// app. The app does not install the CLI onto PATH, so discovery falls back to
+// these candidates (same pattern as the bundled Codex CLI). Candidates are
+// ordered system /Applications before user ~/Applications. On other platforms
+// (e.g. Windows) the CLI is reachable only via MULTICA_WORKBUDDY_PATH /
+// MULTICA_CODEBUDDY_PATH.
+var workbuddyDesktopAppBundlePaths = func() []string {
+	rel := filepath.Join("Contents", "Resources", "app.asar.unpacked", "cli", "bin", "codebuddy")
+	paths := []string{
+		filepath.Join("/Applications", "WorkBuddy.app", rel),
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, "Applications", "WorkBuddy.app", rel))
+	}
+	return paths
+}
+
+// zcodeDesktopAppBundlePaths returns candidate locations for the ZCode CLI
+// that ZCode Desktop bundles. The app does not install `zcode` onto PATH, so a
+// GUI-launched daemon would otherwise miss it entirely — the same situation as
+// the dsh candidate below. Candidates are ordered by install location first
+// (system /Applications before user ~/Applications).
+var zcodeDesktopAppBundlePaths = func() []string {
+	paths := []string{
+		"/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths,
+			filepath.Join(home, "Applications", "ZCode.app", "Contents", "Resources", "glm", "zcode.cjs"),
 		)
 	}
 	return paths
