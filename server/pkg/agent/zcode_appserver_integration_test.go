@@ -14,6 +14,22 @@ import (
 	"time"
 )
 
+// zcodeDesktopAppBundlePaths mirrors the daemon's candidate list in
+// server/internal/daemon/config.go: the CLI bundled inside ZCode Desktop,
+// system /Applications before user ~/Applications. The daemon's copy is
+// package-private, so the smoke test keeps its own.
+func zcodeDesktopAppBundlePaths() []string {
+	paths := []string{
+		"/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths,
+			filepath.Join(home, "Applications", "ZCode.app", "Contents", "Resources", "glm", "zcode.cjs"),
+		)
+	}
+	return paths
+}
+
 // resolveZcodeSmokeExecutable locates a runnable zcode for the real-binary
 // smoke test. It prefers MULTICA_ZCODE_PATH, then `zcode` on PATH, then the
 // CLI bundled inside the ZCode Desktop app.
