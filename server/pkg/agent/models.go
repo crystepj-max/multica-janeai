@@ -329,6 +329,15 @@ func ListModels(ctx context.Context, providerType string, runtimeCmd Command) (C
 		// ModelSelectionSupported. Return an empty list rather than spawning
 		// an ACP subprocess that can only ever come back empty.
 		return Catalog{Models: []Model{}}, nil
+	case "zcode":
+		// ZCode's model registry is runtime state: the personal providers in
+		// ~/.zcode/v2/provider_config.json are what a session can actually
+		// select (the CLI config.json selector is ignored — verified against
+		// 0.16.9). Enumerate from that store; an empty catalog (missing
+		// store) degrades to manual model entry.
+		return cachedDiscovery(discoveryCacheKey(providerType, runtimeCmd), func() (Catalog, error) {
+			return discovered(discoverZcodeRuntimeModels(ctx, runtimeCmd))
+		})
 	default:
 		return Catalog{}, fmt.Errorf("unknown agent type: %q", providerType)
 	}
@@ -1347,6 +1356,125 @@ func isPiDiscoveryNoise(line string) bool {
 		strings.Contains(lower, "usage:") ||
 		strings.Contains(lower, "unknown flag") ||
 		strings.Contains(lower, "unknown command")
+}
+
+// discoverWorkbuddyModels discovers models for the workbuddy built-in runtime.
+// WorkBuddy's bundled CLI is a CodeBuddy fork, so it nominally speaks the same
+// `--acp` handshake — but as of CLI 2.147.0 the stdio ACP mode never answers
+// (initialize/session-new hang with no output until timeout), so
+// discoverCodebuddyModels always times out and returns the codebuddy static
+// fallback whose IDs do not overlap WorkBuddy's real catalog at all. When the
+// handshake yields nothing usable, parse the CLI's own `--help` text instead:
+// the `--model` flag prints "Currently supported: (…)" with the real catalog.
+// The caller always passes the app-bundle path resolved at registration, so
+// the codebuddy PATH fallback inside discoverCodebuddyModels never fires.
+func discoverWorkbuddyModels(ctx context.Context, runtimeCmd Command) ([]Model, error) {
+	catalog, err := discoverCodebuddyModels(ctx, runtimeCmd)
+	if err == nil && len(catalog.Models) > 0 && !catalog.Fallback {
+		return catalog.Models, err
+	}
+	if models := workbuddyHelpCatalog(ctx, runtimeCmd); len(models) > 0 {
+		return models, nil
+	}
+	return catalog.Models, err
+}
+
+// workbuddyHelpCatalog runs `<cli> --help` and extracts the real model list
+// from the `--model` flag description:
+//
+//	--model <model>  Model for the current session. … Currently supported:
+//	                 (fast-model, balanced-model, deep-model, hy4-preview, …)
+//
+// Returns nil when the pattern is absent (different fork version) so the
+// caller can fall back to whatever it had.
+func workbuddyHelpCatalog(ctx context.Context, runtimeCmd Command) []Model {
+	if runtimeCmd.Path == "" {
+		runtimeCmd.Path = "workbuddy"
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := runtimeCmd.exec(runCtx, "--help")
+	hideAgentWindow(cmd)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := outputOwned(cmd, runtimeCmd.logger)
+	if err != nil {
+		slog.Debug("workbuddy model discovery: --help failed", "error", err)
+		return nil
+	}
+	return parseWorkbuddyHelpModels(stdout)
+}
+
+// parseWorkbuddyHelpModels parses the "Currently supported: (…)" list out of
+// WorkBuddy CLI help text. Tier aliases (fast/balanced/deep) are labeled as
+// WorkBuddy presets and balanced-model is marked Default, mirroring the app's
+// own mode toggle; vendor models are grouped via codebuddyModelProvider.
+func parseWorkbuddyHelpModels(data []byte) []Model {
+	const marker = "Currently supported: ("
+	idx := strings.Index(string(data), marker)
+	if idx < 0 {
+		return nil
+	}
+	rest := string(data[idx+len(marker):])
+	end := strings.Index(rest, ")")
+	if end < 0 {
+		return nil
+	}
+	rest = rest[:end]
+	var models []Model
+	for _, id := range strings.Split(rest, ",") {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		models = append(models, Model{
+			ID:       id,
+			Label:    workbuddyModelLabel(id),
+			Provider: workbuddyModelProvider(id),
+			Default:  id == "balanced-model",
+		})
+	}
+	return models
+}
+
+// workbuddyModelLabel maps known WorkBuddy model IDs to display labels;
+// unknown IDs pass through unchanged so a new upstream model still shows up.
+func workbuddyModelLabel(id string) string {
+	labels := map[string]string{
+		"fast-model":          "Fast（快速）",
+		"balanced-model":      "Balanced（均衡）",
+		"deep-model":          "Deep（深度）",
+		"hy4-preview":         "Hy4 Preview",
+		"hy3-x":               "Hy3-X",
+		"hy3":                 "Hy3",
+		"deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+		"deepseek-v4-pro":     "DeepSeek V4 Pro",
+		"glm-5.3-flash":       "GLM-5.3-Flash",
+		"glm-5.3":             "GLM-5.3",
+		"glm-5.2":             "GLM-5.2",
+		"glm-5.1":             "GLM-5.1",
+		"glm-5v-turbo":        "GLM-5V Turbo",
+		"minimax-m3":          "MiniMax M3",
+		"kimi-k3-1":           "Kimi K3.1",
+		"kimi-k2.8-preview":   "Kimi K2.8 Preview",
+		"kimi-k2.7":           "Kimi K2.7",
+		"kimi-k2.6":           "Kimi K2.6",
+	}
+	if label, ok := labels[id]; ok {
+		return label
+	}
+	return id
+}
+
+// workbuddyModelProvider groups models for the picker. The tier aliases are
+// WorkBuddy-internal presets with no single vendor; vendor models reuse the
+// codebuddy prefix heuristics (hy* → hunyuan, glm → zhipu, …).
+func workbuddyModelProvider(id string) string {
+	switch id {
+	case "fast-model", "balanced-model", "deep-model":
+		return "workbuddy"
+	}
+	return codebuddyModelProvider(id)
 }
 
 // discoverOmpModels runs `omp models --json` and parses the JSON catalog.
