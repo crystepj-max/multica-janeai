@@ -613,7 +613,8 @@ func insertFixtureTask(t *testing.T, ctx context.Context, runtimeID, agentID, st
 	if terminal {
 		completedAt = "now()"
 	}
-	// 未关联 issue/chat/autopilot 的 fixture 用 Quick Create context 提供 daemon 鉴权所需 workspace。
+	// This fixture has no issue, chat, or autopilot association, so Quick Create
+	// context provides the workspace required for daemon authorization.
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, status, context, completed_at)
 		VALUES (

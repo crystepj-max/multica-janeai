@@ -102,14 +102,14 @@ multica issue comment update <comment-id> --expected-revision 2 --content "请�
 multica issue runs MUL-123
 ```
 
-为指派给 agent 或 squad、状态仍为 `todo` 的任务排入一次运行。先读取当前 revision：
+为指派给智能体或小队、状态仍为 `todo` 的任务排入一次运行。先读取当前 revision：
 
 ```bash
 multica issue get MUL-123 --output json
 multica issue dispatch MUL-123 --idempotency-key batch-42-MUL-123 --expected-revision 7
 ```
 
-如果不确定请求是否成功，用同一个请求键和 revision 重试；Multica 会返回原运行，不会重复排队。若 revision 已过期，服务会返回 `409 revision_conflict`；请重新读取任务并复核计划后再派发。若该 issue 的指派目标已有进行中或排队中的运行，也会拒绝派发。
+如果不确定请求是否成功，用同一个请求键和 revision 重试；Multica 会返回原运行，不会重复排队。若 revision 已过期，服务会返回 `409 revision_conflict`；请重新读取任务并复核计划后再派发。若该任务的指派目标已有进行中或排队中的运行，也会拒绝派发。
 
 长描述或评论从 stdin 读取，避免处理换行和引号：
 
