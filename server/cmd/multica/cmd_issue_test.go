@@ -5235,6 +5235,73 @@ func TestRunIssueRunsScopeFlagsBuildQuery(t *testing.T) {
 // list of task ids the reader cannot attribute, which is the whole question
 // --siblings answers — and it drops COMPLETED / ERROR, which are empty on
 // every row of a read that only returns work still in flight.
+func TestRunIssueRunsJSONPreservesDispatchIssueRevision(t *testing.T) {
+	const issueID = "1881a167-4bb6-4602-944b-f40ce4192fe6"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/issues/"+issueID+"/task-runs" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": "run-1", "dispatch_issue_revision": 42}})
+	}))
+	defer srv.Close()
+	setCLITestServerEnv(t, srv.URL)
+
+	cmd := newIssueRunsTestCmd(t, "json")
+	out, err := captureStdout(t, func() error { return runIssueRuns(cmd, []string{issueID}) })
+	if err != nil {
+		t.Fatalf("runIssueRuns: %v", err)
+	}
+	var runs []map[string]any
+	if err := json.Unmarshal([]byte(out), &runs); err != nil {
+		t.Fatalf("decode issue runs JSON %q: %v", out, err)
+	}
+	if len(runs) != 1 || runs[0]["dispatch_issue_revision"] != float64(42) {
+		t.Fatalf("runs = %#v, want dispatch_issue_revision 42", runs)
+	}
+}
+
+func TestRunIssueDispatchJSONPreservesDispatchIssueRevision(t *testing.T) {
+	const issueID = "1881a167-4bb6-4602-944b-f40ce4192fe6"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/issues/"+issueID+"/dispatch" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode dispatch request: %v", err)
+		}
+		if body["expected_revision"] != float64(7) {
+			t.Fatalf("dispatch body = %#v, want expected_revision 7", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "run-1", "issue_id": issueID, "status": "queued",
+			"agent_id": "agent-1", "runtime_id": "runtime-1", "dispatch_issue_revision": 7,
+		})
+	}))
+	defer srv.Close()
+	setCLITestServerEnv(t, srv.URL)
+
+	cmd := &cobra.Command{Use: "dispatch"}
+	cmd.Flags().String("idempotency-key", "", "")
+	cmd.Flags().Int64("expected-revision", 0, "")
+	cmd.Flags().String("output", "json", "")
+	_ = cmd.Flags().Set("idempotency-key", "issue-revision-7")
+	_ = cmd.Flags().Set("expected-revision", "7")
+	out, err := captureStdout(t, func() error { return runIssueDispatch(cmd, []string{issueID}) })
+	if err != nil {
+		t.Fatalf("runIssueDispatch: %v", err)
+	}
+	var run map[string]any
+	if err := json.Unmarshal([]byte(out), &run); err != nil {
+		t.Fatalf("decode dispatch JSON %q: %v", out, err)
+	}
+	if run["dispatch_issue_revision"] != float64(7) {
+		t.Fatalf("dispatch response = %#v, want dispatch_issue_revision 7", run)
+	}
+}
+
 func TestRunIssueRunsSiblingsTableRendersFamilyColumns(t *testing.T) {
 	issueID := "1881a167-4bb6-4602-944b-f40ce4192fe6"
 
