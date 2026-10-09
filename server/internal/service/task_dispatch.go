@@ -220,9 +220,26 @@ func (s *TaskService) DispatchIssueWithIdempotencyKey(
 			return ErrIssueDispatchActiveTask
 		}
 
-		txService := *s
-		txService.Queries = qtx
-		txService.deferEnqueueEvents = true
+		// Copy only the shared collaborators. TaskService also owns sync.Map,
+		// atomics, and mutex-protected caches, so copying the whole value is unsafe
+		// and fails the repository's copylocks vet check.
+		txService := &TaskService{
+			Queries:              qtx,
+			TxStarter:            s.TxStarter,
+			deferEnqueueEvents:   true,
+			Hub:                  s.Hub,
+			Bus:                  s.Bus,
+			Analytics:            s.Analytics,
+			Metrics:              s.Metrics,
+			Wakeup:               s.Wakeup,
+			Entitlements:         s.Entitlements,
+			SourceContextStorage: s.SourceContextStorage,
+			FeatureFlags:         s.FeatureFlags,
+			EmptyClaim:           s.EmptyClaim,
+			ReclaimCheck:         s.ReclaimCheck,
+			Composio:             s.Composio,
+			QuickActions:         s.QuickActions,
+		}
 		if isLeader {
 			task, replayed, err = txService.EnqueueTaskForSquadLeaderRunTriggerWithHandoff(ctx, issue, targetAgentID, squadID, "", actorUserID)
 		} else {
