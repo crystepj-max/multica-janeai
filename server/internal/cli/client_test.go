@@ -166,6 +166,35 @@ func TestPostJSON(t *testing.T) {
 	})
 }
 
+func TestPostJSONWithIdempotencyKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Idempotency-Key"); got != "dispatch-2026-10-08-01" {
+			t.Errorf("Idempotency-Key = %q, want stable request key", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"task-123"}`)
+	}))
+	defer srv.Close()
+
+	client := NewAPIClient(srv.URL, "", "test-token")
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := client.PostJSONWithIdempotencyKey(context.Background(), "/dispatch", map[string]any{}, "dispatch-2026-10-08-01", &out); err != nil {
+		t.Fatalf("PostJSONWithIdempotencyKey: %v", err)
+	}
+	if out.ID != "task-123" {
+		t.Fatalf("response id = %q, want task-123", out.ID)
+	}
+}
+
+func TestPostJSONWithIdempotencyKeyRejectsBlankKey(t *testing.T) {
+	client := NewAPIClient("http://unused.invalid", "", "")
+	if err := client.PostJSONWithIdempotencyKey(context.Background(), "/dispatch", nil, "  ", nil); err == nil {
+		t.Fatal("expected blank Idempotency-Key to be rejected before the request")
+	}
+}
+
 func TestDeleteJSONResponse(t *testing.T) {
 	type respBody struct {
 		ID string `json:"id"`

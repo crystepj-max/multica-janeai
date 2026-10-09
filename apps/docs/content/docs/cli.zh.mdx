@@ -102,6 +102,15 @@ multica issue comment update <comment-id> --expected-revision 2 --content "请�
 multica issue runs MUL-123
 ```
 
+为指派给 agent 或 squad、状态仍为 `todo` 的任务排入一次运行。先读取当前 revision：
+
+```bash
+multica issue get MUL-123 --output json
+multica issue dispatch MUL-123 --idempotency-key batch-42-MUL-123 --expected-revision 7
+```
+
+如果不确定请求是否成功，用同一个请求键和 revision 重试；Multica 会返回原运行，不会重复排队。若 revision 已过期，服务会返回 `409 revision_conflict`；请重新读取任务并复核计划后再派发。若该 issue 的指派目标已有进行中或排队中的运行，也会拒绝派发。
+
 长描述或评论从 stdin 读取，避免处理换行和引号：
 
 ```bash
@@ -245,6 +254,7 @@ CLI 配置文件包含可代表你访问 Multica 的令牌。不要提交到仓�
 | | `run-messages <task-id>` | 查看单次执行的消息 | `--since`、`--issue` |
 | | `usage <issue-id>` | 查看聚合 token 用量 | |
 | | `rerun <id>` | 按当前指派重新入队执行 | |
+| | `dispatch <id>` | 为 `todo` 任务排队一次运行，并安全处理重试 | `--idempotency-key`（重试时复用）、`--expected-revision`（从 `issue get` 读取的正数 revision） |
 | | `cancel-task <task-id>` | 取消进行中或排队中的运行 | `--issue` |
 | `project` | `list/get/create/update/delete` | 管理项目 | |
 | | `status <id> <status>` | 修改项目状态 | |

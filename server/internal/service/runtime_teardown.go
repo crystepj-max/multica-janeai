@@ -25,8 +25,8 @@ func OfflineRuntimeTTLDays() int {
 
 var (
 	// ErrRuntimeNotDrained means a runtime or one of its bound user agents
-	// still owns a non-terminal task. Callers must abort the transaction rather
-	// than deleting the runtime and relying on database cascades.
+	// still owns an active Run, a pending stop acknowledgement, or another
+	// non-terminal task. Callers must abort rather than deleting the runtime.
 	ErrRuntimeNotDrained = errors.New("runtime still has non-terminal tasks")
 	// ErrRuntimeWorkspaceMismatch protects tenant isolation if legacy or
 	// corrupted data binds an agent to a runtime from another workspace.
@@ -35,7 +35,8 @@ var (
 
 // RuntimeTeardownOptions controls the only intentional semantic difference
 // between user-confirmed deletion and retention GC. Manual deletion cancels
-// active work; automatic GC must fail closed and leave it untouched.
+// queued work after confirming no Run is active; automatic GC fails closed and
+// leaves all non-terminal tasks untouched.
 type RuntimeTeardownOptions struct {
 	CancelNonTerminalTasks bool
 }
@@ -91,6 +92,17 @@ func TeardownRuntime(ctx context.Context, qtx *db.Queries, runtimeID pgtype.UUID
 	}
 
 	if opts.CancelNonTerminalTasks {
+		awaitingStop, err := qtx.CountTasksAwaitingStopForRuntimeOrAgent(ctx, db.CountTasksAwaitingStopForRuntimeOrAgentParams{
+			RuntimeIds: []pgtype.UUID{runtimeID},
+			AgentIds:   lockedAgentIDs,
+		})
+		if err != nil {
+			return out, fmt.Errorf("count runs awaiting stop: %w", err)
+		}
+		if awaitingStop > 0 {
+			return out, fmt.Errorf("%w: %d runs need a runtime stop acknowledgement", ErrRuntimeNotDrained, awaitingStop)
+		}
+
 		cancelled, err := qtx.CancelAgentTasksByRuntimeOrAgent(ctx, db.CancelAgentTasksByRuntimeOrAgentParams{
 			RuntimeIds: []pgtype.UUID{runtimeID},
 			AgentIds:   lockedAgentIDs,

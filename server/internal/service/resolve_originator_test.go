@@ -465,6 +465,7 @@ func TestEnqueueTaskForIssueStoresRuntimeMCPOverlayInQueuedRow(t *testing.T) {
 	userID := util.MustParseUUID(userIDStr)
 	task, err := svc.EnqueueTaskForIssue(ctx, db.Issue{
 		ID:           util.MustParseUUID(issueIDStr),
+		Revision:     1,
 		AssigneeID:   util.MustParseUUID(agentIDStr),
 		Priority:     "medium",
 		CreatorType:  "member",

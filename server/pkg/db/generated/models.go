@@ -177,6 +177,9 @@ type AgentTaskQueue struct {
 	CancelledByID             pgtype.UUID `json:"cancelled_by_id"`
 	CancelledByName           pgtype.Text `json:"cancelled_by_name"`
 	IssueSnapshot             []byte      `json:"issue_snapshot"`
+	CancelAckPending          bool        `json:"cancel_ack_pending"`
+	// Issue revision whose assignment/status trigger requested this task. Non-NULL only for automatic issue dispatch and explicit issue dispatch; a unique index coalesces both paths for the same issue, agent, and revision.
+	DispatchIssueRevision pgtype.Int8 `json:"dispatch_issue_revision"`
 }
 
 type AgentToLabel struct {
@@ -832,6 +835,18 @@ type IssueDependency struct {
 	IssueID          pgtype.UUID `json:"issue_id"`
 	DependsOnIssueID pgtype.UUID `json:"depends_on_issue_id"`
 	Type             string      `json:"type"`
+}
+
+// Durable idempotency records for explicit issue dispatch requests. The reservation and queued task commit in one transaction.
+type IssueDispatchRequest struct {
+	WorkspaceID           pgtype.UUID        `json:"workspace_id"`
+	IdempotencyKey        string             `json:"idempotency_key"`
+	IssueID               pgtype.UUID        `json:"issue_id"`
+	ExpectedIssueRevision int64              `json:"expected_issue_revision"`
+	ActorType             string             `json:"actor_type"`
+	ActorID               pgtype.UUID        `json:"actor_id"`
+	TaskID                pgtype.UUID        `json:"task_id"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 }
 
 type IssueLabel struct {

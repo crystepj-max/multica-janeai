@@ -398,6 +398,7 @@ type AgentTaskResponse struct {
 	// presenting a truncated catalog as the whole one.
 	IssueStatusesOmitted int                   `json:"issue_statuses_omitted,omitempty"`
 	ThreadName           string                `json:"thread_name,omitempty"` // semantic title for provider-native session/thread history
+	DispatchReused       bool                  `json:"dispatch_reused,omitempty"`
 	Status               string                `json:"status"`
 	Priority             int32                 `json:"priority"`
 	DispatchedAt         *string               `json:"dispatched_at"`

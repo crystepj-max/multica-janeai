@@ -676,6 +676,13 @@ func (h *Handler) DeleteMember(w http.ResponseWriter, r *http.Request) {
 	requesterUserID := requestUserID(r)
 	result, err := h.revokeAndRemoveMember(r.Context(), target.WorkspaceID, target.UserID, target.ID, parseUUID(requesterUserID))
 	if err != nil {
+		if errors.Is(err, errMemberRunsNotDrained) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "This member still has active or stopping Runs. Stop them and wait for their runtimes to confirm they have ended before removing the member.",
+				"code":  "workspace_member_runs_not_drained",
+			})
+			return
+		}
 		slog.Warn("delete member failed", append(logger.RequestAttrs(r), "error", err, "member_id", memberID, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to delete member")
 		return
@@ -720,6 +727,13 @@ func (h *Handler) LeaveWorkspace(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.revokeAndRemoveMember(r.Context(), member.WorkspaceID, member.UserID, member.ID, member.UserID)
 	if err != nil {
+		if errors.Is(err, errMemberRunsNotDrained) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "You still have active or stopping Runs. Stop them and wait for their runtimes to confirm they have ended before leaving the workspace.",
+				"code":  "workspace_member_runs_not_drained",
+			})
+			return
+		}
 		slog.Warn("leave workspace failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to leave workspace")
 		return
@@ -800,6 +814,14 @@ func isRetryableLockFailure(err error) bool {
 // with a message the delete dialog can show; every other failure stays a 500.
 func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, step string, err error) {
 	attrs := append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID, "step", step)
+	if errors.Is(err, errWorkspaceRunsNotDrained) {
+		slog.Warn("workspace delete blocked by active or stopping Runs", attrs...)
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "This workspace still has active or stopping Runs. Stop them and wait for their runtimes to confirm they have ended before deleting the workspace.",
+			"code":  "workspace_delete_not_drained",
+		})
+		return
+	}
 	if isRetryableLockFailure(err) {
 		slog.Warn("workspace delete blocked by lock contention", attrs...)
 		writeError(w, http.StatusServiceUnavailable, "workspace deletion is temporarily blocked by another operation, please try again")
@@ -808,6 +830,8 @@ func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, st
 	slog.Warn("workspace delete step failed", attrs...)
 	writeError(w, http.StatusInternalServerError, "failed to delete workspace")
 }
+
+var errWorkspaceRunsNotDrained = errors.New("workspace has active or stopping Runs")
 
 // workspaceDeleteTaskPageSize bounds one task page: the ids held in this process,
 // the array parameter sent back to Postgres, and the row count of a single
@@ -1166,6 +1190,22 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			// lockWorkspaceTaskOwners.
 			name: "lock task owners",
 			run:  func() error { return lockWorkspaceTaskOwners(ctx, qtx, requester.WorkspaceID) },
+		},
+		{
+			// Deleting the workspace also deletes task rows and runtime identity.
+			// Keep both intact until every active Run has stopped and its owner
+			// has acknowledged cancellation.
+			name: "check active Runs",
+			run: func() error {
+				count, err := qtx.CountWorkspaceTasksAwaitingStop(ctx, requester.WorkspaceID)
+				if err != nil {
+					return err
+				}
+				if count > 0 {
+					return errWorkspaceRunsNotDrained
+				}
+				return nil
+			},
 		},
 		{
 			name: "prepare relationship graph",

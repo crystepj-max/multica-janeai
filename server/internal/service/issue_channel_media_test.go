@@ -443,6 +443,13 @@ func TestCreateIssuePropertiesAreVisibleAtCommitBeforeEnqueue(t *testing.T) {
 	if !result.AssignedTaskID.Valid {
 		t.Fatal("assigned task was not enqueued after property-bearing commit")
 	}
+	var dispatchRevision pgtype.Int8
+	if err := pool.QueryRow(ctx, `SELECT dispatch_issue_revision FROM agent_task_queue WHERE id = $1`, result.AssignedTaskID).Scan(&dispatchRevision); err != nil {
+		t.Fatalf("read automatic task dispatch revision: %v", err)
+	}
+	if !dispatchRevision.Valid || dispatchRevision.Int64 != result.Issue.Revision {
+		t.Fatalf("automatic task dispatch revision = %+v, want committed issue revision %d", dispatchRevision, result.Issue.Revision)
+	}
 	if len(createdEvents) != 1 || propertyChangedEvents != 0 {
 		t.Fatalf("create events = %d issue:created, %d property-changed; want 1 and 0", len(createdEvents), propertyChangedEvents)
 	}
