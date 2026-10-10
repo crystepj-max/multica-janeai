@@ -257,12 +257,14 @@ func TestStartDshProfileProvision_RunsAtMostOnce(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(readRecord(t, record), "plugin --profile multica add") {
+		// The command record is written before the background installer finishes.
+		// Wait for completion so TempDir cleanup cannot race its profile writes.
+		if !d.dshInstallInFlight.Load() && strings.Contains(readRecord(t, record), "plugin --profile multica add") {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("the install never ran; recorded %q", readRecord(t, record))
+	t.Fatalf("the install never completed; recorded %q", readRecord(t, record))
 }
 
 func TestStartDshProfileProvision_UnconfiguredNeverStarts(t *testing.T) {
