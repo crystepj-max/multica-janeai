@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -240,6 +241,22 @@ func TestDeleteWorkspace_CollectsTasksThroughEveryOwnershipPath(t *testing.T) {
 		t.Skip("database not available")
 	}
 	f := newWorkspaceDeletePathFixture(t, "endtoend")
+	if _, err := testPool.Exec(context.Background(), `
+INSERT INTO issue_dispatch_request (
+    workspace_id, idempotency_key, issue_id, expected_issue_revision, actor_type, actor_id
+)
+VALUES ($1, 'delete-victim', $2, 1, 'member', $3),
+       ($4, 'delete-neighbour', $5, 1, 'member', $3)
+`, f.victimID, f.victimIssue, testUserID, f.neighbourID, f.neighbourIssue); err != nil {
+		t.Fatalf("create dispatch request fixtures: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `
+DELETE FROM issue_dispatch_request
+WHERE (workspace_id = $1 AND idempotency_key = 'delete-victim')
+   OR (workspace_id = $2 AND idempotency_key = 'delete-neighbour')
+`, f.victimID, f.neighbourID)
+	})
 
 	w := httptest.NewRecorder()
 	req := newRequest("DELETE", "/api/workspaces/"+f.victimID, nil)
@@ -282,6 +299,78 @@ func TestDeleteWorkspace_CollectsTasksThroughEveryOwnershipPath(t *testing.T) {
 	if rowExists(t, "workspace", f.victimID) {
 		t.Error("victim workspace still exists")
 	}
+	var requests int
+	if err := testPool.QueryRow(context.Background(), `
+SELECT count(*) FROM issue_dispatch_request WHERE workspace_id = $1
+`, f.victimID).Scan(&requests); err != nil {
+		t.Fatalf("count victim dispatch requests: %v", err)
+	}
+	if requests != 0 {
+		t.Errorf("workspace deletion left %d issue dispatch request(s)", requests)
+	}
+	if err := testPool.QueryRow(context.Background(), `
+SELECT count(*) FROM issue_dispatch_request WHERE workspace_id = $1
+`, f.neighbourID).Scan(&requests); err != nil {
+		t.Fatalf("count neighbour dispatch requests: %v", err)
+	}
+	if requests != 1 {
+		t.Errorf("workspace deletion changed neighbour dispatch requests to %d, want 1", requests)
+	}
+}
+
+func TestDeleteWorkspace_WaitsForRunCancellationAck(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	f := newWorkspaceDeletePathFixture(t, "drain")
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue SET status = 'running', completed_at = NULL, started_at = now()
+		WHERE id = $1
+	`, f.taskViaAgent); err != nil {
+		t.Fatalf("set fixture task running: %v", err)
+	}
+
+	deleteWorkspace := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := newRequest("DELETE", "/api/workspaces/"+f.victimID, nil)
+		req = withURLParam(req, "id", f.victimID)
+		testHandler.DeleteWorkspace(w, req)
+		return w
+	}
+	assertBlocked := func() {
+		t.Helper()
+		w := deleteWorkspace()
+		if w.Code != http.StatusConflict {
+			t.Fatalf("workspace delete with a live Run = %d, want 409: %s", w.Code, w.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode conflict response: %v", err)
+		}
+		if body["code"] != "workspace_delete_not_drained" {
+			t.Fatalf("workspace delete conflict code = %v", body["code"])
+		}
+		if !rowExists(t, "workspace", f.victimID) || !rowExists(t, "agent_task_queue", f.taskViaAgent) || !rowExists(t, "agent_runtime", f.victimRuntime) {
+			t.Fatal("blocked workspace delete removed workspace, task history, or runtime identity")
+		}
+	}
+
+	assertBlocked()
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue SET status = 'cancelled', completed_at = now()
+		WHERE id = $1
+	`, f.taskViaAgent); err != nil {
+		t.Fatalf("mark fixture task cancelled: %v", err)
+	}
+	var ackPending bool
+	if err := testPool.QueryRow(ctx, `SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, f.taskViaAgent).Scan(&ackPending); err != nil {
+		t.Fatalf("read pending stop acknowledgement: %v", err)
+	}
+	if !ackPending {
+		t.Fatal("running-to-cancelled transition did not retain the capacity reservation")
+	}
+	assertBlocked()
 }
 
 // shrinkWorkspaceDeletePagesForTest makes the paging tests cross their page

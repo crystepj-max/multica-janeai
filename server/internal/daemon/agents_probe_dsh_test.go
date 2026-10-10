@@ -122,7 +122,9 @@ func TestProbeDshMulticaProfile(t *testing.T) {
 	}
 	origTimeout := dshProbeTimeout
 	t.Cleanup(func() { dshProbeTimeout = origTimeout })
-	dshProbeTimeout = 2 * time.Second
+	// Keep the healthy shell fixture below the timeout even while `go test
+	// -race` is scheduling this package alongside the rest of the server suite.
+	dshProbeTimeout = 5 * time.Second
 
 	// A cancelled round says nothing about the profile, whatever the manifest
 	// says: the probe never got to finish on its own terms.

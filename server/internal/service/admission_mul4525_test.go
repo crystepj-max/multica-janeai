@@ -27,6 +27,7 @@ func TestRerunIssueBlockedBeforeMutationWhenInvokeDenied(t *testing.T) {
 
 	issueStruct := db.Issue{
 		ID:           util.MustParseUUID(issueID),
+		Revision:     1,
 		AssigneeID:   util.MustParseUUID(agentID),
 		Priority:     "medium",
 		CreatorType:  "member",

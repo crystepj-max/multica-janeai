@@ -407,16 +407,122 @@ RETURNING id
 	}
 }
 
+// TestMergeLegacyRuntime_WaitsForCancellationAcknowledgement keeps the old
+// daemon/runtime identity available until every active Run has stopped. Moving
+// a cancelled task to the new runtime before its ack would make
+// AckAgentTaskCancellation fail its runtime/daemon ownership check.
+func TestMergeLegacyRuntime_WaitsForCancellationAcknowledgement(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	f := newWorkspaceDeletePathFixture(t, "merge-drain")
+	notifier := &recordingRuntimeGoneNotifier{}
+	h := *testHandler
+	h.DaemonRuntimeGone = notifier
+
+	var target string
+	if err := testPool.QueryRow(ctx, `
+INSERT INTO agent_runtime (workspace_id, name, runtime_mode, provider, status, device_info, metadata, owner_id)
+VALUES ($1, 'drain merge target', 'cloud', 'delete-test', 'offline', '', '{}'::jsonb, $2)
+RETURNING id
+`, f.victimID, testUserID).Scan(&target); err != nil {
+		t.Fatalf("create merge target: %v", err)
+	}
+	// Make this task a valid task owned by the old runtime and its bound agent.
+	if _, err := testPool.Exec(ctx, `
+UPDATE agent_task_queue SET runtime_id = $1, issue_id = $2 WHERE id = $3
+`, f.victimRuntime, f.victimIssue, f.taskViaAgent); err != nil {
+		t.Fatalf("bind fixture task to old runtime: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+UPDATE agent_task_queue SET status = 'running', completed_at = NULL, started_at = now()
+WHERE id = $1
+`, f.taskViaAgent); err != nil {
+		t.Fatalf("set fixture task running: %v", err)
+	}
+
+	assertMergeBlocked := func() {
+		t.Helper()
+		err := h.mergeLegacyRuntime(ctx, parseUUID(target), parseUUID(f.victimRuntime), "legacy-daemon", "delete-test")
+		if !errors.Is(err, errRuntimeMergeNotDrained) {
+			t.Fatalf("mergeLegacyRuntime = %v, want errRuntimeMergeNotDrained", err)
+		}
+		if !rowExists(t, "agent_runtime", f.victimRuntime) || !rowExists(t, "agent_task_queue", f.taskViaAgent) {
+			t.Fatal("blocked merge removed the old runtime or its task")
+		}
+		var taskRuntime string
+		if err := testPool.QueryRow(ctx,
+			`SELECT runtime_id FROM agent_task_queue WHERE id = $1`, f.taskViaAgent).Scan(&taskRuntime); err != nil {
+			t.Fatalf("read task runtime: %v", err)
+		}
+		if taskRuntime != f.victimRuntime {
+			t.Fatalf("task runtime = %s while merge was blocked, want old runtime %s", taskRuntime, f.victimRuntime)
+		}
+		var agentRuntime string
+		if err := testPool.QueryRow(ctx,
+			`SELECT runtime_id FROM agent WHERE id = $1`, f.victimAgent).Scan(&agentRuntime); err != nil {
+			t.Fatalf("read agent runtime: %v", err)
+		}
+		if agentRuntime != f.victimRuntime {
+			t.Fatalf("agent runtime = %s while merge was blocked, want old runtime %s", agentRuntime, f.victimRuntime)
+		}
+		if len(notifier.runtimeIDs) != 0 {
+			t.Fatalf("blocked merge emitted runtime-gone notifications: %v", notifier.runtimeIDs)
+		}
+	}
+
+	assertMergeBlocked()
+	if _, err := testPool.Exec(ctx, `
+UPDATE agent_task_queue SET status = 'cancelled', completed_at = now() WHERE id = $1
+`, f.taskViaAgent); err != nil {
+		t.Fatalf("cancel fixture task: %v", err)
+	}
+	var ackPending bool
+	if err := testPool.QueryRow(ctx,
+		`SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, f.taskViaAgent).Scan(&ackPending); err != nil {
+		t.Fatalf("read pending cancellation acknowledgement: %v", err)
+	}
+	if !ackPending {
+		t.Fatal("running-to-cancelled transition did not retain the cancellation acknowledgement")
+	}
+	assertMergeBlocked()
+
+	if _, err := testPool.Exec(ctx,
+		`UPDATE agent_task_queue SET cancel_ack_pending = FALSE WHERE id = $1`, f.taskViaAgent); err != nil {
+		t.Fatalf("acknowledge fixture cancellation: %v", err)
+	}
+	if err := h.mergeLegacyRuntime(ctx, parseUUID(target), parseUUID(f.victimRuntime), "legacy-daemon", "delete-test"); err != nil {
+		t.Fatalf("merge after cancellation acknowledgement: %v", err)
+	}
+	if rowExists(t, "agent_runtime", f.victimRuntime) {
+		t.Error("old runtime survived the drained merge")
+	}
+	var taskRuntime string
+	if err := testPool.QueryRow(ctx,
+		`SELECT runtime_id FROM agent_task_queue WHERE id = $1`, f.taskViaAgent).Scan(&taskRuntime); err != nil {
+		t.Fatalf("read reassigned task runtime: %v", err)
+	}
+	if taskRuntime != target {
+		t.Errorf("task runtime = %s after merge, want new runtime %s", taskRuntime, target)
+	}
+	if len(notifier.runtimeIDs) != 1 || notifier.runtimeIDs[0] != f.victimRuntime {
+		t.Fatalf("runtime-gone notifications = %v, want [%s]", notifier.runtimeIDs, f.victimRuntime)
+	}
+}
+
 // TestMergeLegacyRuntime_RollsBackWhenAStepFails is the fault-injection half of the
-// merge contract: the four statements have to land together or not at all.
+// merge contract: the rebind, task reassignment, audit write, and delete have to
+// land together or not at all.
 //
 // Run as autocommit statements the merge could commit the task reassignment and
 // then fail on the agent reassignment, leaving tasks on the new runtime and their
-// agents on the old one while daemon registration still reported success. Worse,
-// the fence's workspace lock ended with its own statement, so a teardown could slip
-// into that gap, delete the target runtime and clear runtime_id on the tasks that
-// had just moved — history the next merge could no longer find, because it looks up
-// tasks by the OLD runtime id.
+// agents on the old one while daemon registration still reported success. The
+// transaction also rolls back an earlier agent rebind if a later step fails.
+// Worse, the fence's workspace lock ended with its own statement, so a teardown
+// could slip into that gap, delete the target runtime and clear runtime_id on the
+// tasks that had just moved — history the next merge could no longer find, because
+// it looks up tasks by the OLD runtime id.
 //
 // The failure is injected in the database rather than through a code seam, so the
 // test exercises the real statements: a trigger makes any agent row moving onto the

@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/google/uuid"
@@ -11,13 +13,14 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// revokeAndRemoveMember converges all server-side state that should follow a
-// member leaving a workspace: every runtime they own becomes unusable, every
-// agent pinned to one of those runtimes is archived, every in-flight task on
-// those runtimes is cancelled (cancelled rather than failed so the daemon's
-// per-task status poller interrupts the running agent gracefully), the
-// member's durable subscriptions and daemon_token rows are deleted, and
-// finally the member row itself is removed.
+var errMemberRunsNotDrained = errors.New("member has active or stopping Runs")
+
+// revokeAndRemoveMember converges server-side state after the member's Runs
+// have drained: it archives their agents, cancels queued tasks, takes their
+// runtimes offline, removes their daemon tokens and subscriptions, and deletes
+// the member row. If an active Run or cancellation acknowledgement is pending,
+// it aborts the transaction so the credentials and runtime identity remain
+// available for the stop request to finish.
 //
 // All DB writes run inside a single transaction so a partial revocation never
 // leaves the workspace half-converged — e.g. a member who is "gone" but whose
@@ -26,17 +29,10 @@ import (
 // publishRevocation) so connected clients and other workspace members observe
 // the new state immediately.
 //
-// Note on scope: this revokes every runtime whose owner_id matches userID,
-// regardless of how the daemon authenticates. Today most daemons fall back to
-// PAT/JWT and `daemon_token` rows are unused in production; deleting them is
-// a no-op for those daemons but takes effect once the mdt_ flow is live.
-// Either way the agent-archive + task-cancel + force-offline writes are the
-// actual production safety net: even if the daemon races back online with a
-// still-valid PAT, it finds no agent it can run for, no queued task to claim,
-// and the dispatcher (which gates on agent.archived_at IS NULL) won't hand it
-// new work — and the member-row deletion in the same tx means subsequent
-// requireWorkspaceMember checks will reject the daemon's PAT-authenticated
-// requests with 404.
+// The run-drain check happens inside the same transaction as the archive,
+// cancellation, credential revocation and member deletion. A conflict rolls
+// all of those writes back, so a daemon that still needs to acknowledge its
+// stop retains the workspace access required to do so.
 //
 // archivedBy is the actor who triggered the revocation. For DeleteMember it's
 // the requester (the admin doing the kick); for LeaveWorkspace it's the leaver
@@ -78,10 +74,32 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 	if len(runtimes) > 0 {
 		runtimeIDs := make([]pgtype.UUID, len(runtimes))
 		daemonIDs := make([]string, 0, len(runtimes))
+		userAgentIDs := make([]pgtype.UUID, 0)
 		for i, rt := range runtimes {
 			runtimeIDs[i] = rt.ID
 			if rt.DaemonID.Valid && rt.DaemonID.String != "" {
 				daemonIDs = append(daemonIDs, rt.DaemonID.String)
+			}
+			// Match runtime teardown's lock order. This prevents a new agent
+			// binding from appearing after the cancellation sweep and includes
+			// already-archived agents whose old tasks may still reference a
+			// different runtime.
+			lockedRuntime, err := qtx.LockAgentRuntime(ctx, rt.ID)
+			if err != nil {
+				if isNotFound(err) {
+					continue
+				}
+				return empty, fmt.Errorf("lock runtime during member revocation: %w", err)
+			}
+			agents, err := qtx.ListUserAgentsByRuntimeForUpdate(ctx, rt.ID)
+			if err != nil {
+				return empty, fmt.Errorf("lock runtime agents during member revocation: %w", err)
+			}
+			if err := service.ValidateRuntimeAgentWorkspaces(lockedRuntime, agents); err != nil {
+				return empty, fmt.Errorf("validate runtime agents during member revocation: %w", err)
+			}
+			for _, agent := range agents {
+				userAgentIDs = append(userAgentIDs, agent.ID)
 			}
 		}
 
@@ -99,16 +117,22 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 		// have queued/running tasks pinned to a different runtime — and
 		// ClaimAgentTask does not gate on agent.archived_at, so those tasks
 		// would otherwise stay claimable after the agent is gone.
-		archivedAgentIDs := make([]pgtype.UUID, len(result.ArchivedAgents))
-		for i, a := range result.ArchivedAgents {
-			archivedAgentIDs[i] = a.ID
-		}
 		result.CancelledTasks, err = qtx.CancelAgentTasksByRuntimeOrAgent(ctx, db.CancelAgentTasksByRuntimeOrAgentParams{
 			RuntimeIds: runtimeIDs,
-			AgentIds:   archivedAgentIDs,
+			AgentIds:   userAgentIDs,
 		})
 		if err != nil {
 			return empty, err
+		}
+		awaitingStop, err := qtx.CountTasksAwaitingStopForRuntimeOrAgent(ctx, db.CountTasksAwaitingStopForRuntimeOrAgentParams{
+			RuntimeIds: runtimeIDs,
+			AgentIds:   userAgentIDs,
+		})
+		if err != nil {
+			return empty, fmt.Errorf("check runtime stop acknowledgements during member revocation: %w", err)
+		}
+		if awaitingStop > 0 {
+			return empty, fmt.Errorf("%w: %d runs need a runtime stop acknowledgement before member removal", errMemberRunsNotDrained, awaitingStop)
 		}
 		if err = service.SettleTerminalTaskState(ctx, qtx, result.CancelledTasks...); err != nil {
 			return empty, err

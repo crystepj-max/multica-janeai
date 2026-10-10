@@ -62,6 +62,7 @@ func TestEnqueueTaskForMentionCoalescesDuplicatePendingTask(t *testing.T) {
 
 	issueStruct := db.Issue{
 		ID:           util.MustParseUUID(issueID),
+		Revision:     1,
 		AssigneeID:   util.MustParseUUID(agentID),
 		Priority:     "medium",
 		CreatorType:  "member",
@@ -101,13 +102,8 @@ func TestEnqueueTaskForMentionCoalescesDuplicatePendingTask(t *testing.T) {
 }
 
 // TestEnqueueTaskForIssueCoalescesDuplicatePendingTask is the service-level
-// regression for the issue-assignee enqueue path (#5914). EnqueueTaskForIssue
-// routes through enqueueIssueTaskWithCommentPlan, the second write point of the
-// idx_one_pending_task_per_issue_agent unique index. A concurrent duplicate on
-// this path used to surface as a raw create-task error (HTTP 500 with the
-// leaked constraint name); it must now return the same typed
-// ErrDuplicatePendingTask sentinel as the mention path and leave exactly one
-// pending task behind.
+// regression for the issue-assignee enqueue path. Automatic no-comment
+// assignment retries for one issue revision must reuse the same Run.
 func TestEnqueueTaskForIssueCoalescesDuplicatePendingTask(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
@@ -119,6 +115,7 @@ func TestEnqueueTaskForIssueCoalescesDuplicatePendingTask(t *testing.T) {
 
 	issueStruct := db.Issue{
 		ID:           util.MustParseUUID(issueID),
+		Revision:     1,
 		AssigneeID:   util.MustParseUUID(agentID),
 		Priority:     "medium",
 		CreatorType:  "member",
@@ -129,21 +126,19 @@ func TestEnqueueTaskForIssueCoalescesDuplicatePendingTask(t *testing.T) {
 	svc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
 
 	// First assignee enqueue creates the pending task.
-	if _, err := svc.EnqueueTaskForIssue(ctx, issueStruct); err != nil {
+	first, err := svc.EnqueueTaskForIssue(ctx, issueStruct)
+	if err != nil {
 		t.Fatalf("first EnqueueTaskForIssue: %v", err)
 	}
 
-	// Second enqueue for the same (issue, agent) collides on the unique index.
-	_, err := svc.EnqueueTaskForIssue(ctx, issueStruct)
-	if !errors.Is(err, ErrDuplicatePendingTask) {
-		t.Fatalf("second EnqueueTaskForIssue: err = %v, want ErrDuplicatePendingTask", err)
+	// Repeating the automatic trigger for the same issue revision reuses the
+	// original Run rather than surfacing a duplicate-task error.
+	reused, err := svc.EnqueueTaskForIssue(ctx, issueStruct)
+	if err != nil {
+		t.Fatalf("second EnqueueTaskForIssue: %v", err)
 	}
-	// The returned error must NOT carry the raw Postgres constraint name or
-	// SQLSTATE — those used to leak into upper-layer warning logs (#5914).
-	for _, leak := range []string{"idx_one_pending_task_per_issue_agent", "23505", "SQLSTATE", "duplicate key"} {
-		if strings.Contains(err.Error(), leak) {
-			t.Fatalf("duplicate error leaked %q: %v", leak, err)
-		}
+	if reused.ID != first.ID {
+		t.Fatalf("second EnqueueTaskForIssue returned %s, want original Run %s", util.UUIDToString(reused.ID), util.UUIDToString(first.ID))
 	}
 
 	var n int

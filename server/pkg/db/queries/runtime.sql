@@ -354,7 +354,8 @@ RETURNING *;
 -- name: CountUndrainedTasksByRuntimeOrAgent :one
 -- Belt-and-braces gate for the runtime-delete transaction: after cancelling,
 -- every task on this runtime OR owned by an agent being unbound must be terminal
--- (completed_at IS NOT NULL) before the unbind UPDATE runs. The agent-side
+-- (completed_at IS NOT NULL) and have no pending stop acknowledgement before the
+-- unbind UPDATE runs. The agent-side
 -- predicate must mirror CancelAgentTasksByRuntimeOrAgent: a task can remain
 -- pinned to another runtime after its agent moves. Non-zero means some
 -- non-terminal status escaped the cancel query — the handler aborts with 409
@@ -362,7 +363,15 @@ RETURNING *;
 -- into an opaque 500, and rather than deleting rows to make it go away.
 SELECT count(*) FROM agent_task_queue
 WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
-  AND completed_at IS NULL;
+  AND (completed_at IS NULL OR cancel_ack_pending);
+
+-- name: CountTasksAwaitingStopForRuntimeOrAgent :one
+-- Runtime teardown may cancel queued work, but it must not delete the runtime
+-- while an execution could still be running on that machine. The owner first
+-- stops each active Run and waits for its runtime-bound cancellation ack.
+SELECT count(*) FROM agent_task_queue
+WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
+  AND (status IN ('dispatched', 'running', 'waiting_local_directory') OR cancel_ack_pending);
 
 -- name: UnbindTasksFromRuntime :execrows
 -- Detaches this runtime's task history so deleting the runtime row cannot
@@ -375,7 +384,7 @@ WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid
 -- every row on the runtime.
 UPDATE agent_task_queue
 SET runtime_id = NULL
-WHERE runtime_id = $1 AND completed_at IS NOT NULL;
+WHERE runtime_id = $1 AND completed_at IS NOT NULL AND NOT cancel_ack_pending;
 
 -- name: UnbindUserAgentsFromRuntime :many
 -- MUL-5559: the runtime-delete replacement for archive-then-hard-delete. Every

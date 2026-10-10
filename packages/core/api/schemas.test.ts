@@ -632,6 +632,22 @@ describe("TimelineEntriesSchema", () => {
 });
 
 describe("AgentTaskListSchema", () => {
+  it("preserves the dispatch Task revision and accepts legacy Runs without it", () => {
+    const parsed = AgentTaskListSchema.parse([
+      { id: "new-run", dispatch_issue_revision: 42 },
+      { id: "legacy-run" },
+    ]);
+
+    expect(parsed[0]?.dispatch_issue_revision).toBe(42);
+    expect(parsed[1]?.dispatch_issue_revision).toBeUndefined();
+  });
+
+  it.each([0, -1, 1.5, "42", null])("degrades malformed dispatch revision without dropping the Run: %s", (value) => {
+    const parsed = AgentTaskListSchema.parse([{ id: "run", dispatch_issue_revision: value }]);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.dispatch_issue_revision).toBeUndefined();
+  });
+
   it("preserves negotiated supplement capability, ordered coverage and permission", () => {
     const parsed = AgentTaskListSchema.parse([{
       id: "run",

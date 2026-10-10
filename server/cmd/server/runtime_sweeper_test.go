@@ -202,6 +202,13 @@ func TestRefreshAgentStatusFromTasks(t *testing.T) {
 	`, taskID); err != nil {
 		t.Fatalf("failed to cancel seeded task: %v", err)
 	}
+	// The status flip reserves capacity until the daemon acknowledges the
+	// cancellation. This test exercises the later refresh after that ACK.
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue SET cancel_ack_pending = FALSE WHERE id = $1
+	`, taskID); err != nil {
+		t.Fatalf("failed to acknowledge seeded task cancellation: %v", err)
+	}
 	if _, err := testPool.Exec(ctx, `UPDATE agent SET status = 'working' WHERE id = $1`, agentID); err != nil {
 		t.Fatalf("failed to reseed working agent status: %v", err)
 	}

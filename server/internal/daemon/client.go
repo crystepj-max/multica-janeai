@@ -566,7 +566,7 @@ type TaskCancelAck struct {
 // carries a branch or an error it is a terminal delivery — the only pointer to
 // the cancelled task's work — and a single lost POST would lose it forever.
 // The server never overwrites already-recorded values, so replays are safe.
-func (c *Client) AckTaskCancelled(ctx context.Context, taskID string, ack TaskCancelAck) error {
+func (c *Client) AckTaskCancelled(ctx context.Context, taskID, daemonID string, ack TaskCancelAck) error {
 	body := map[string]any{}
 	if ack.BranchName != "" {
 		body["branch_name"] = ack.BranchName
@@ -580,7 +580,11 @@ func (c *Client) AckTaskCancelled(ctx context.Context, taskID string, ack TaskCa
 	if ack.FailureReason != "" {
 		body["failure_reason"] = ack.FailureReason
 	}
-	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), body, nil, defaultTerminalRetrySchedule)
+	headers := make(http.Header)
+	if daemonID != "" {
+		headers.Set("X-Client-Daemon-ID", daemonID)
+	}
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), body, nil, defaultTerminalRetrySchedule, headers)
 }
 
 func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, step, total int) error {
@@ -1221,14 +1225,14 @@ func isTransientError(err error) bool {
 // The server-side CompleteTask / FailTask treat "already terminal" as an
 // idempotent success (see service/task.go), so a duplicate replay from a
 // retry is safe even if the server's prior response was lost in transit.
-func (c *Client) postJSONWithRetry(ctx context.Context, path string, reqBody any, respBody any, schedule []time.Duration) error {
-	return c.postJSONViaWithRetry(ctx, c.client, path, reqBody, respBody, schedule, nil)
+func (c *Client) postJSONWithRetry(ctx context.Context, path string, reqBody any, respBody any, schedule []time.Duration, extraHeaders ...http.Header) error {
+	return c.postJSONViaWithRetry(ctx, c.client, path, reqBody, respBody, schedule, nil, extraHeaders...)
 }
 
 // postJSONViaWithRetry is postJSONWithRetry over an explicit http.Client, so
 // large-body endpoints can run on bundleClient (deadline from ctx) while the
 // control-plane keeps its fixed 30s client.
-func (c *Client) postJSONViaWithRetry(ctx context.Context, httpClient *http.Client, path string, reqBody any, respBody any, schedule []time.Duration, stats *TransferStats) error {
+func (c *Client) postJSONViaWithRetry(ctx context.Context, httpClient *http.Client, path string, reqBody any, respBody any, schedule []time.Duration, stats *TransferStats, extraHeaders ...http.Header) error {
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -1237,7 +1241,7 @@ func (c *Client) postJSONViaWithRetry(ctx context.Context, httpClient *http.Clie
 			}
 			return err
 		}
-		err := c.postJSONViaObserved(ctx, httpClient, path, reqBody, respBody, stats)
+		err := c.postJSONViaObserved(ctx, httpClient, path, reqBody, respBody, stats, extraHeaders...)
 		if err == nil {
 			return nil
 		}
@@ -1274,7 +1278,7 @@ func (c *Client) postJSONVia(ctx context.Context, httpClient *http.Client, path 
 // moved into stats (nil to skip). Callers use it to tell "the link never
 // produced a response" apart from "the body arrived too slowly to finish" —
 // see TransferStats.
-func (c *Client) postJSONViaObserved(ctx context.Context, httpClient *http.Client, path string, reqBody any, respBody any, stats *TransferStats) error {
+func (c *Client) postJSONViaObserved(ctx context.Context, httpClient *http.Client, path string, reqBody any, respBody any, stats *TransferStats, extraHeaders ...http.Header) error {
 	var body io.Reader
 	if reqBody != nil {
 		data, err := json.Marshal(reqBody)
@@ -1293,6 +1297,13 @@ func (c *Client) postJSONViaObserved(ctx context.Context, httpClient *http.Clien
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 	c.setIdentityHeaders(req)
+	for _, headers := range extraHeaders {
+		for key, values := range headers {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

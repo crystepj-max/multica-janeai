@@ -432,6 +432,16 @@ var issueRerunCmd = &cobra.Command{
 	RunE:  runIssueRerun,
 }
 
+var issueDispatchCmd = &cobra.Command{
+	Use:   "dispatch <id>",
+	Short: "Queue one run for a todo issue with retry-safe request identity",
+	Long: "Queue one run for an issue that is still in todo. Pass a stable --idempotency-key, " +
+		"pass the positive revision from `multica issue get --output json`, and reuse both values " +
+		"if you retry after a lost response; the server returns the original run.",
+	Args: exactArgs(1),
+	RunE: runIssueDispatch,
+}
+
 var issueCancelTaskCmd = &cobra.Command{
 	Use:   "cancel-task <run-id>",
 	Short: "Cancel an in-progress or queued run (interrupts in-flight agent)",
@@ -568,6 +578,7 @@ func init() {
 	issueCmd.AddCommand(issueRunMessagesCmd)
 	issueCmd.AddCommand(issueUsageCmd)
 	issueCmd.AddCommand(issueRerunCmd)
+	issueCmd.AddCommand(issueDispatchCmd)
 	issueCmd.AddCommand(issueCancelTaskCmd)
 	issueCmd.AddCommand(issueSearchCmd)
 
@@ -688,6 +699,12 @@ func init() {
 
 	// issue rerun
 	issueRerunCmd.Flags().String("output", "json", "Output format: table or json")
+	// issue dispatch
+	issueDispatchCmd.Flags().String("idempotency-key", "", "Stable request key; reuse this exact value when retrying after an uncertain response")
+	_ = issueDispatchCmd.MarkFlagRequired("idempotency-key")
+	issueDispatchCmd.Flags().Int64("expected-revision", 0, "Positive issue revision; prevents dispatching a stale plan")
+	_ = issueDispatchCmd.MarkFlagRequired("expected-revision")
+	issueDispatchCmd.Flags().String("output", "json", "Output format: table or json")
 	// issue cancel-task
 	issueCancelTaskCmd.Flags().String("output", "json", "Output format: table or json")
 	issueCancelTaskCmd.Flags().String("issue", "", "Issue ID/key to scope short run ID prefix resolution")
@@ -2872,6 +2889,44 @@ func runIssueRerun(cmd *cobra.Command, args []string) error {
 	}
 	agent := loadActorDisplayLookup(ctx, client).agent(strVal(task, "agent_id"))
 	fmt.Fprintf(os.Stdout, "Re-enqueued run %s on agent %s\n", strVal(task, "id"), agent)
+	return nil
+}
+
+func runIssueDispatch(cmd *cobra.Command, args []string) error {
+	expectedRevision, _ := cmd.Flags().GetInt64("expected-revision")
+	if !cmd.Flags().Changed("expected-revision") || expectedRevision < 1 {
+		return fmt.Errorf("--expected-revision is required and must be a positive integer; read it from `multica issue get <issue-id> --output json`")
+	}
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueRef, err := resolveIssueRef(ctx, client, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve issue: %w", err)
+	}
+	key, _ := cmd.Flags().GetString("idempotency-key")
+	var task map[string]any
+	if err := client.PostJSONWithIdempotencyKey(
+		ctx,
+		"/api/issues/"+issueRef.ID+"/dispatch",
+		map[string]any{"expected_revision": expectedRevision},
+		key,
+		&task,
+	); err != nil {
+		return fmt.Errorf("dispatch issue: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, task)
+	}
+	agent := loadActorDisplayLookup(ctx, client).agent(strVal(task, "agent_id"))
+	fmt.Fprintf(os.Stdout, "Run %s is queued on agent %s\n", strVal(task, "id"), agent)
 	return nil
 }
 

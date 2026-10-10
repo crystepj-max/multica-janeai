@@ -1861,6 +1861,10 @@ export const AgentTaskSchema = z.object({
   agent_id: z.string().default(""),
   runtime_id: z.string().default(""),
   issue_id: z.string().default(""),
+  // Assignment/status-triggered Runs carry the Task revision that caused
+  // dispatch. Older Runs and servers omit it, so consumers must treat it as
+  // unknown rather than infer it from timestamps.
+  dispatch_issue_revision: z.number().int().positive().optional().catch(undefined),
   status: z.string().default("cancelled"),
   priority: z.number().default(0),
   dispatched_at: z.string().nullable().default(null),

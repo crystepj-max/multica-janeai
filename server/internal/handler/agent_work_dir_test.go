@@ -229,6 +229,20 @@ func TestTaskToResponseDerivesPrivateDurableWorkDir(t *testing.T) {
 	}
 }
 
+func TestTaskToResponseIncludesDispatchIssueRevision(t *testing.T) {
+	response := taskToResponse(db.AgentTaskQueue{
+		DispatchIssueRevision: pgtype.Int8{Int64: 42, Valid: true},
+	}, "")
+	if response.DispatchIssueRevision == nil || *response.DispatchIssueRevision != 42 {
+		t.Fatalf("dispatch_issue_revision = %v, want 42", response.DispatchIssueRevision)
+	}
+
+	legacyResponse := taskToResponse(db.AgentTaskQueue{}, "")
+	if legacyResponse.DispatchIssueRevision != nil {
+		t.Fatalf("dispatch_issue_revision = %v for a legacy Run, want omitted", legacyResponse.DispatchIssueRevision)
+	}
+}
+
 // TestStableIDSuffixMatchesDaemon pins the handler's path validation to the
 // current readable suffixes used by execenv.PredictRootDir. The table above
 // separately pins compatibility with both historical layouts.
