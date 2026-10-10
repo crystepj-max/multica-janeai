@@ -183,16 +183,9 @@ func (s *TaskService) DispatchIssueWithIdempotencyKey(
 			IssueID: issue.ID, AgentID: targetAgentID, DispatchIssueRevision: dispatchRevision,
 		})
 		if existingErr == nil {
-			active, err := qtx.HasActiveTaskForIssueAndAgent(ctx, db.HasActiveTaskForIssueAndAgentParams{
-				IssueID: issue.ID,
-				AgentID: targetAgentID,
-			})
-			if err != nil {
-				return fmt.Errorf("check active issue dispatch task: %w", err)
-			}
-			if active {
-				return ErrIssueDispatchActiveTask
-			}
+			// 同一 Task revision 的自动 Run 已经存在时，显式入口只复用它。
+			// queued/running 也不能被视为新派发冲突；此路径不创建 Run、
+			// 不取消旧执行，也不释放其容量。不同 revision 仍走下方活跃检查。
 			task = existing
 			replayed = true
 			updated, err := qtx.SetIssueDispatchRequestTaskID(ctx, db.SetIssueDispatchRequestTaskIDParams{

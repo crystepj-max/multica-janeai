@@ -149,7 +149,7 @@ func TestDispatchIssueWithIdempotencyKeyConcurrentReplay(t *testing.T) {
 	}
 }
 
-func TestDispatchIssueDoesNotReplaceExistingPendingTask(t *testing.T) {
+func TestDispatchIssueDoesNotReplaceEarlierPendingTask(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
 	workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
@@ -178,6 +178,12 @@ func TestDispatchIssueDoesNotReplaceExistingPendingTask(t *testing.T) {
 		t.Fatalf("enqueue existing pending task: %v", err)
 	}
 
+	// 已有 Run 属于上一任务周期；新的 revision 仍不得绕过未停止的执行。
+	if _, err := pool.Exec(ctx, `UPDATE issue SET revision = revision + 1 WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("advance issue revision: %v", err)
+	}
+	expectedRevision = dispatchTestIssueRevision(t, ctx, pool, issueID)
+
 	_, _, err = svc.DispatchIssueWithIdempotencyKey(
 		ctx, issue.WorkspaceID, issue.ID, "dispatch-with-pending-task", expectedRevision, "member", issue.CreatorID, issue.CreatorID, func(db.Agent) bool { return true },
 	)
@@ -202,57 +208,61 @@ func TestDispatchIssueDoesNotReplaceExistingPendingTask(t *testing.T) {
 }
 
 func TestDispatchIssueReusesAutomaticRunForSameIssueRevision(t *testing.T) {
-	pool := newResolveOriginatorPool(t)
-	ctx := context.Background()
-	workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
-	if _, err := pool.Exec(ctx, `UPDATE issue SET status = 'todo' WHERE id = $1`, issueID); err != nil {
-		t.Fatalf("set issue to todo: %v", err)
-	}
-	expectedRevision := dispatchTestIssueRevision(t, ctx, pool, issueID)
-	t.Cleanup(func() {
-		pool.Exec(context.Background(), `DELETE FROM issue_dispatch_request WHERE issue_id = $1`, issueID)
-		pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-	})
+	for _, status := range []string{"queued", "running", "completed"} {
+		t.Run(status, func(t *testing.T) {
+			pool := newResolveOriginatorPool(t)
+			ctx := context.Background()
+			workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
+			if _, err := pool.Exec(ctx, `UPDATE issue SET status = 'todo' WHERE id = $1`, issueID); err != nil {
+				t.Fatalf("set issue to todo: %v", err)
+			}
+			expectedRevision := dispatchTestIssueRevision(t, ctx, pool, issueID)
+			t.Cleanup(func() {
+				pool.Exec(context.Background(), `DELETE FROM issue_dispatch_request WHERE issue_id = $1`, issueID)
+				pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+			})
 
-	workspaceUUID := util.MustParseUUID(workspaceID)
-	issueUUID := util.MustParseUUID(issueID)
-	actorUUID := util.MustParseUUID(userID)
-	issue, err := db.New(pool).GetIssue(ctx, issueUUID)
-	if err != nil {
-		t.Fatalf("load issue: %v", err)
-	}
-	svc := &TaskService{Queries: db.New(pool), TxStarter: pool, Bus: events.New()}
-	automatic, reused, err := svc.EnqueueTaskForIssueRunTrigger(ctx, issue, "", actorUUID)
-	if err != nil {
-		t.Fatalf("enqueue automatic issue run: %v", err)
-	}
-	if reused {
-		t.Fatal("first automatic issue run was marked reused")
-	}
-	if automatic.AgentID != util.MustParseUUID(agentID) {
-		t.Fatalf("automatic run agent = %s, want %s", util.UUIDToString(automatic.AgentID), agentID)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, automatic.ID); err != nil {
-		t.Fatalf("complete automatic run: %v", err)
-	}
+			workspaceUUID := util.MustParseUUID(workspaceID)
+			issueUUID := util.MustParseUUID(issueID)
+			actorUUID := util.MustParseUUID(userID)
+			issue, err := db.New(pool).GetIssue(ctx, issueUUID)
+			if err != nil {
+				t.Fatalf("load issue: %v", err)
+			}
+			svc := &TaskService{Queries: db.New(pool), TxStarter: pool, Bus: events.New()}
+			automatic, reused, err := svc.EnqueueTaskForIssueRunTrigger(ctx, issue, "", actorUUID)
+			if err != nil {
+				t.Fatalf("enqueue automatic issue run: %v", err)
+			}
+			if reused {
+				t.Fatal("first automatic issue run was marked reused")
+			}
+			if automatic.AgentID != util.MustParseUUID(agentID) {
+				t.Fatalf("automatic run agent = %s, want %s", util.UUIDToString(automatic.AgentID), agentID)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = $2 WHERE id = $1`, automatic.ID, status); err != nil {
+				t.Fatalf("set automatic run status: %v", err)
+			}
 
-	dispatched, replayed, err := svc.DispatchIssueWithIdempotencyKey(
-		ctx, workspaceUUID, issueUUID, "dispatch-same-revision", expectedRevision, "member", actorUUID, actorUUID, func(db.Agent) bool { return true },
-	)
-	if err != nil {
-		t.Fatalf("dispatch same issue revision: %v", err)
-	}
-	if !replayed || dispatched.ID != automatic.ID || dispatched.Status != "completed" {
-		t.Fatalf("dispatch result = (id=%s, status=%s, reused=%t), want the existing completed run %s",
-			util.UUIDToString(dispatched.ID), dispatched.Status, replayed, util.UUIDToString(automatic.ID))
-	}
+			dispatched, replayed, err := svc.DispatchIssueWithIdempotencyKey(
+				ctx, workspaceUUID, issueUUID, "dispatch-same-revision", expectedRevision, "member", actorUUID, actorUUID, func(db.Agent) bool { return true },
+			)
+			if err != nil {
+				t.Fatalf("dispatch same issue revision: %v", err)
+			}
+			if !replayed || dispatched.ID != automatic.ID || dispatched.Status != status {
+				t.Fatalf("dispatch result = (id=%s, status=%s, reused=%t), want the existing %s run %s",
+					util.UUIDToString(dispatched.ID), dispatched.Status, replayed, status, util.UUIDToString(automatic.ID))
+			}
 
-	var taskCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, issueID, agentID).Scan(&taskCount); err != nil {
-		t.Fatalf("count issue runs: %v", err)
-	}
-	if taskCount != 1 {
-		t.Fatalf("issue runs for same revision = %d, want 1", taskCount)
+			var taskCount int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, issueID, agentID).Scan(&taskCount); err != nil {
+				t.Fatalf("count issue runs: %v", err)
+			}
+			if taskCount != 1 {
+				t.Fatalf("issue runs for same revision = %d, want 1", taskCount)
+			}
+		})
 	}
 }
 
@@ -563,7 +573,7 @@ func TestAutomaticAndExplicitIssueDispatchRaceCreatesOneRun(t *testing.T) {
 	}
 }
 
-func TestDispatchIssueRejectsActiveTaskEvenWhenIssueRemainsTodo(t *testing.T) {
+func TestDispatchIssueRejectsEarlierActiveTaskEvenWhenIssueRemainsTodo(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
 	workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
@@ -594,6 +604,12 @@ func TestDispatchIssueRejectsActiveTaskEvenWhenIssueRemainsTodo(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'running', started_at = now() WHERE id = $1`, activeTask.ID); err != nil {
 		t.Fatalf("mark fixture task running: %v", err)
 	}
+
+	// 已有 Run 属于上一任务周期；新的 revision 仍不得绕过未停止的执行。
+	if _, err := pool.Exec(ctx, `UPDATE issue SET revision = revision + 1 WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("advance issue revision: %v", err)
+	}
+	expectedRevision = dispatchTestIssueRevision(t, ctx, pool, issueID)
 
 	_, _, err = svc.DispatchIssueWithIdempotencyKey(
 		ctx, issue.WorkspaceID, issue.ID, "dispatch-while-running", expectedRevision, "member", issue.CreatorID, issue.CreatorID, func(db.Agent) bool { return true },
