@@ -302,6 +302,9 @@ ORDER BY created_at DESC;
 -- issues with no linked PR. Issue-linked tasks never hit quick-create context
 -- parsing (parseQuickCreateContext short-circuits on IssueID.Valid), so this
 -- key rides harmlessly alongside.
+-- dispatch_issue_revision is present only for the assignment/status auto-run
+-- and explicit issue-dispatch paths. A unique index makes those paths share one
+-- Run even if the automatic trigger and dev-flow race each other.
 -- id is minted by the application as a UUIDv7 (pkg/dbid) so consecutive
 -- enqueues cluster in a narrow contiguous primary-key range instead of
 -- scattering across the B-tree. On a table with existing v4 ids, that range
@@ -314,6 +317,7 @@ INSERT INTO agent_task_queue (
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id,
+    dispatch_issue_revision,
     id
 )
 SELECT
@@ -339,9 +343,21 @@ SELECT
     sqlc.narg(rerun_of_task_id),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
+    sqlc.narg('dispatch_issue_revision')::bigint,
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 WHERE lock_task_owner_rows($1, $3, $2)
+ON CONFLICT (issue_id, agent_id, dispatch_issue_revision)
+    WHERE issue_id IS NOT NULL AND dispatch_issue_revision IS NOT NULL
+DO NOTHING
 RETURNING *;
+
+-- name: GetIssueTaskForDispatchRevision :one
+SELECT * FROM agent_task_queue
+WHERE issue_id = $1
+  AND agent_id = $2
+  AND dispatch_issue_revision = $3
+ORDER BY created_at, id
+LIMIT 1;
 
 -- name: CreateDeferredChannelIssueTask :one
 -- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
@@ -783,7 +799,10 @@ WHERE id = (
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
           WHERE active.agent_id = atq.agent_id
-            AND active.status IN ('dispatched', 'running', 'waiting_local_directory')
+            AND (
+              active.status IN ('dispatched', 'running', 'waiting_local_directory')
+              OR active.cancel_ack_pending
+            )
             AND (
               (atq.issue_id IS NOT NULL AND active.issue_id = atq.issue_id)
               OR (atq.chat_session_id IS NOT NULL AND active.chat_session_id = atq.chat_session_id)
@@ -1682,6 +1701,18 @@ SET error = sqlc.arg('error'),
     failure_reason = COALESCE(failure_reason, sqlc.arg('failure_reason'))
 WHERE id = sqlc.arg('id') AND (error IS NULL OR error = '') AND status = 'cancelled';
 
+-- name: AckAgentTaskCancellation :execrows
+-- Only the daemon that owned the cancelled run may release its capacity hold.
+-- Runtime teardown keeps this runtime row and task binding until the ack lands.
+UPDATE agent_task_queue AS task
+SET cancel_ack_pending = FALSE
+FROM agent_runtime AS runtime
+WHERE task.id = @task_id
+  AND task.status = 'cancelled'
+  AND task.cancel_ack_pending
+  AND task.runtime_id = runtime.id
+  AND runtime.daemon_id = @daemon_id;
+
 -- name: CancelAgentTaskWithReason :one
 -- Cancels a task AND records why, for cancellations the user did not ask for.
 --
@@ -1776,8 +1807,11 @@ LIMIT @max_per_tick::int;
 -- an atomic reservation/CAS gate. Consequently a waiter-only agent is reported
 -- idle by RefreshAgentStatusFromTasks but still cannot claim additional work;
 -- removing it here alone could exceed max_concurrent_tasks when it resumes.
+-- A cancelled task remains capacity-bearing until its owning daemon confirms
+-- that the runner has stopped.
 SELECT count(*) FROM agent_task_queue
-WHERE agent_id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory');
+WHERE agent_id = $1
+  AND (status IN ('dispatched', 'running', 'waiting_local_directory') OR cancel_ack_pending);
 
 -- name: GetAgentForClaimUpdate :one
 SELECT * FROM agent
@@ -2803,7 +2837,8 @@ RETURNING *;
 WITH desired AS (
     SELECT CASE WHEN EXISTS (
         SELECT 1 FROM agent_task_queue q
-        WHERE q.agent_id = $1 AND q.status IN ('dispatched', 'running')
+        WHERE q.agent_id = $1
+          AND (q.status IN ('dispatched', 'running') OR q.cancel_ack_pending)
     ) THEN 'working' ELSE 'idle' END AS status
 )
 UPDATE agent AS a

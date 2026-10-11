@@ -87,7 +87,7 @@ func (h *Handler) dispatchIssueRun(ctx context.Context, issue db.Issue, trigger 
 		// The member who performed this assign/promote is the accountable human
 		// for the run (MUL-4302 §4). An agent actor is not a human, so only a
 		// member actor is threaded; otherwise attribution falls back to the chain.
-		_, _ = h.TaskService.EnqueueTaskForIssueWithHandoff(ctx, issue, handoffNote, memberActorUserID(actorType, actorID))
+		_, _, _ = h.TaskService.EnqueueTaskForIssueRunTrigger(ctx, issue, handoffNote, memberActorUserID(actorType, actorID))
 	case "squad":
 		h.enqueueSquadLeaderTask(ctx, issue, pgtype.UUID{}, actorType, actorID, handoffNote)
 	}

@@ -1080,16 +1080,16 @@ func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Same teardown the confirmed path runs: unbind the runtime's agents and
-	// their task history, cancel what was still active, remove only the system
-	// agents. There is no active agent here by definition, but archived ones and
-	// their history can still be bound to this runtime.
+	// their task history, cancel queued work, and remove only the system agents.
+	// Active Runs must already be stopped and acknowledged before the runtime can
+	// be removed; archived agents and their history can still be bound here.
 	teardown, err := service.TeardownRuntime(r.Context(), qtx, rt.ID, service.RuntimeTeardownOptions{CancelNonTerminalTasks: true})
 	if err != nil {
 		if errors.Is(err, service.ErrRuntimeNotDrained) {
 			slog.Error("runtime delete aborted: tasks not drained",
 				"runtime_id", uuidToString(rt.ID), "error", err)
 			writeJSON(w, http.StatusConflict, map[string]any{
-				"error": "the runtime still has tasks in flight; retry in a moment.",
+				"error": "the runtime still has active or stopping Runs. Stop them and wait for their runtime to confirm they have ended before retrying.",
 				"code":  "runtime_delete_not_drained",
 			})
 			return
@@ -1172,10 +1172,11 @@ type unbindAgentsAndDeleteRuntimeRequest struct {
 }
 
 // UnbindAgentsAndDeleteRuntime is the confirmed delete entry point: unbind every
-// user agent bound to the runtime, pause affected Autopilots, cancel active
+// user agent bound to the runtime, pause affected Autopilots, cancel queued
 // tasks, detach task history, hard-delete only the system agents, and finally
 // delete the runtime row — all inside a single transaction so a partial failure
-// never leaves a runtime half-torn-down.
+// never leaves a runtime half-torn-down. Active Runs must already be stopped
+// and acknowledged before deletion can proceed.
 //
 // Before MUL-5559 this archived those agents and then hard-deleted the rows,
 // destroying every conversation with them; the dialog said "archive", so what
@@ -1299,16 +1300,17 @@ func (h *Handler) UnbindAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.Re
 	}
 
 	// Single teardown, shared with the light DELETE path: unbind every user
-	// agent (active and archived) plus their task history, cancel what was
-	// running or queued, and hard-delete only the system agents. Nothing the
-	// user configured is destroyed — the agents just need a new runtime.
+	// agent (active and archived) plus their task history, cancel queued work,
+	// and hard-delete only the system agents. Active Runs must already be stopped
+	// and acknowledged. Nothing the user configured is destroyed — the agents
+	// just need a new runtime.
 	teardown, err := service.TeardownRuntime(r.Context(), qtx, rt.ID, service.RuntimeTeardownOptions{CancelNonTerminalTasks: true})
 	if err != nil {
 		if errors.Is(err, service.ErrRuntimeNotDrained) {
 			slog.Error("runtime delete aborted: tasks not drained",
 				"runtime_id", uuidToString(rt.ID), "error", err)
 			writeJSON(w, http.StatusConflict, map[string]any{
-				"error": "the runtime still has tasks in flight; retry in a moment.",
+				"error": "the runtime still has active or stopping Runs. Stop them and wait for their runtime to confirm they have ended before retrying.",
 				"code":  "runtime_delete_not_drained",
 			})
 			return

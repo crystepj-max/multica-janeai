@@ -11,6 +11,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countWorkspaceTasksAwaitingStop = `-- name: CountWorkspaceTasksAwaitingStop :one
+SELECT count(*) FROM agent_task_queue AS task
+WHERE (task.status IN ('dispatched', 'running', 'waiting_local_directory') OR task.cancel_ack_pending)
+  AND (
+    EXISTS (SELECT 1 FROM agent WHERE agent.id = task.agent_id AND agent.workspace_id = $1)
+    OR EXISTS (SELECT 1 FROM issue WHERE issue.id = task.issue_id AND issue.workspace_id = $1)
+    OR EXISTS (SELECT 1 FROM agent_runtime WHERE agent_runtime.id = task.runtime_id AND agent_runtime.workspace_id = $1)
+  )
+`
+
+// Workspace deletion removes task history and runtime identity, so it must
+// leave both in place until every owner has stopped active work and the
+// runtime-bound cancellation acknowledgement has arrived.
+func (q *Queries) CountWorkspaceTasksAwaitingStop(ctx context.Context, workspaceID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countWorkspaceTasksAwaitingStop, workspaceID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteTaskBatch = `-- name: DeleteTaskBatch :exec
 WITH
 batch AS MATERIALIZED (
@@ -354,6 +374,9 @@ deleted_issue_dependencies AS (
 deleted_issue_subscribers AS (
     DELETE FROM issue_subscriber
     WHERE issue_id IN (SELECT id FROM ws_issues)
+),
+deleted_issue_dispatch_requests AS (
+    DELETE FROM issue_dispatch_request WHERE workspace_id = $1
 ),
 deleted_issue_labels AS (
     DELETE FROM issue_to_label

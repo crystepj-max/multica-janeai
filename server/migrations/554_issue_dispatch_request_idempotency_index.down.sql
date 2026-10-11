@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_issue_dispatch_request_workspace_key;

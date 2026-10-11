@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/requestkey"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -228,6 +229,131 @@ func (h *Handler) RerunIssue(w http.ResponseWriter, r *http.Request) {
 	resp := taskToResponse(*task, uuidToString(issue.WorkspaceID))
 	h.hydrateTaskAttributions(r.Context(), []*TaskAttribution{resp.Attribution})
 	writeJSON(w, http.StatusAccepted, resp)
+}
+
+// DispatchIssue creates one queued Run for an issue and requires a durable
+// Idempotency-Key and the issue revision observed by the planner so clients
+// can safely retry after a lost response without dispatching a stale plan.
+// This is separate from the destructive, human-facing rerun operation.
+func (h *Handler) DispatchIssue(w http.ResponseWriter, r *http.Request) {
+	key, err := requestkey.ParseIdempotencyKey(r.Header.Get("Idempotency-Key"))
+	if errors.Is(err, requestkey.ErrIdempotencyKeyRequired) || errors.Is(err, requestkey.ErrIdempotencyKeyTooLong) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid Idempotency-Key")
+		return
+	}
+	expectedRevision, err := decodeIssueDispatchExpectedRevision(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	issue, ok := h.loadIssueForUser(w, r, id)
+	if !ok {
+		return
+	}
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	workspaceID := uuidToString(issue.WorkspaceID)
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	actorUUID, ok := parseUUIDOrBadRequest(w, actorID, "actor id")
+	if !ok {
+		return
+	}
+	actorUserID := memberActorUserID(actorType, actorID)
+	originatorUserID := h.invokeOriginatorFromRequest(r, actorType, actorID)
+	canInvoke := func(agent db.Agent) bool {
+		return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
+	}
+
+	task, replayed, err := h.TaskService.DispatchIssueWithIdempotencyKey(
+		r.Context(), issue.WorkspaceID, issue.ID, key, expectedRevision, actorType, actorUUID, actorUserID, canInvoke,
+	)
+	var revisionConflict *service.IssueDispatchRevisionConflictError
+	if errors.As(err, &revisionConflict) {
+		writeRevisionConflict(w, "issue", issue.ID, revisionConflict.Expected, revisionConflict.Actual)
+		return
+	}
+	switch {
+	case errors.Is(err, requestkey.ErrIdempotencyKeyRequired), errors.Is(err, requestkey.ErrIdempotencyKeyTooLong):
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	case errors.Is(err, service.ErrRerunInvokeNotAllowed):
+		h.writeDispatchBlocked(w, http.StatusForbidden, ReasonInvocationNotAllowed)
+		return
+	case errors.Is(err, service.ErrIssueInTriage):
+		h.writeDispatchBlocked(w, http.StatusForbidden, ReasonIssueInTriage)
+		return
+	case errors.Is(err, service.ErrIssueDispatchKeyConflict):
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  "idempotency_key_conflict",
+			"error": "Idempotency-Key was already used for a different dispatch request",
+		})
+		return
+	case errors.Is(err, service.ErrIssueDispatchActorRequired):
+		writeError(w, http.StatusForbidden, "issue dispatch requires a valid actor")
+		return
+	case errors.Is(err, service.ErrIssueDispatchRevisionRequired):
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	case errors.Is(err, service.ErrIssueDispatchNotTodo),
+		errors.Is(err, service.ErrIssueDispatchActiveTask),
+		errors.Is(err, service.ErrIssueDispatchUnsupportedAssignee),
+		errors.Is(err, service.ErrIssueDispatchTargetUnavailable),
+		errors.Is(err, service.ErrDuplicatePendingTask):
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  "issue_dispatch_unavailable",
+			"error": err.Error(),
+		})
+		return
+	case errors.Is(err, pgx.ErrNoRows):
+		writeError(w, http.StatusNotFound, "issue not found")
+		return
+	case errors.Is(err, service.ErrIssueDispatchTransactionsRequired):
+		slog.Error("issue dispatch requires transaction support", "issue_id", id)
+		writeError(w, http.StatusInternalServerError, "issue dispatch failed")
+		return
+	case err != nil:
+		slog.Warn("issue dispatch failed", "issue_id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, "issue dispatch failed")
+		return
+	}
+
+	if replayed {
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	resp := taskToResponse(task, workspaceID)
+	resp.DispatchReused = replayed
+	h.hydrateTaskAttributions(r.Context(), []*TaskAttribution{resp.Attribution})
+	writeJSON(w, http.StatusAccepted, resp)
+}
+
+func decodeIssueDispatchExpectedRevision(body io.Reader) (int64, error) {
+	if body == nil {
+		return 0, errors.New("expected_revision must be a positive integer")
+	}
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	var req struct {
+		ExpectedRevision int64 `json:"expected_revision"`
+	}
+	if err := decoder.Decode(&req); err != nil {
+		return 0, errors.New("expected_revision must be a positive integer")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return 0, errors.New("dispatch request must contain one JSON object")
+	}
+	if req.ExpectedRevision < 1 {
+		return 0, errors.New("expected_revision must be a positive integer")
+	}
+	return req.ExpectedRevision, nil
 }
 
 // RetrySourceContextQuickCreate manually re-enqueues a failed issue-less

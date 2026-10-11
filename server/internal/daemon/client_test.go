@@ -623,13 +623,15 @@ func TestTerminalReportsCarryDurableWorkDir(t *testing.T) {
 		{
 			name: "cancel ack",
 			call: func(c *Client) error {
-				return c.AckTaskCancelled(context.Background(), "task-1", TaskCancelAck{DurableWorkDir: durableWorkDir})
+				return c.AckTaskCancelled(context.Background(), "task-1", "daemon-test", TaskCancelAck{DurableWorkDir: durableWorkDir})
 			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var body map[string]any
+			var daemonIDHeader string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				daemonIDHeader = r.Header.Get("X-Client-Daemon-ID")
 				_ = json.NewDecoder(r.Body).Decode(&body)
 				w.WriteHeader(http.StatusOK)
 			}))
@@ -641,6 +643,66 @@ func TestTerminalReportsCarryDurableWorkDir(t *testing.T) {
 			if got := body["durable_work_dir"]; got != durableWorkDir {
 				t.Fatalf("durable_work_dir = %v, want %q (body: %v)", got, durableWorkDir, body)
 			}
+			if tc.name == "cancel ack" && daemonIDHeader != "daemon-test" {
+				t.Fatalf("cancel ack daemon identity header = %q, want daemon-test", daemonIDHeader)
+			}
 		})
+	}
+}
+
+func TestAckTaskCancelledRetriesTransient5xxThenSucceeds(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	var calls atomic.Int32
+	var paths []string
+	var daemonIDs []string
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		daemonIDs = append(daemonIDs, r.Header.Get("X-Client-Daemon-ID"))
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode cancel-ack request: %v", err)
+		}
+		bodies = append(bodies, body)
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := NewClient(srv.URL).AckTaskCancelled(context.Background(), "task-1", "daemon-test", TaskCancelAck{
+		BranchName:     "task-branch",
+		DurableWorkDir: "/workspace/project",
+		ErrorMessage:   "finalize failed",
+		FailureReason:  "worktree_finalize",
+	})
+	if err != nil {
+		t.Fatalf("AckTaskCancelled: %v", err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("cancel-ack attempts = %d, want 3 (two transient failures and success)", got)
+	}
+
+	wantBody := map[string]string{
+		"branch_name":      "task-branch",
+		"durable_work_dir": "/workspace/project",
+		"error_message":    "finalize failed",
+		"failure_reason":   "worktree_finalize",
+	}
+	for i := range bodies {
+		if paths[i] != "/api/daemon/tasks/task-1/cancel-ack" {
+			t.Errorf("attempt %d path = %q, want cancel-ack endpoint", i+1, paths[i])
+		}
+		if daemonIDs[i] != "daemon-test" {
+			t.Errorf("attempt %d daemon ID = %q, want daemon-test", i+1, daemonIDs[i])
+		}
+		for key, want := range wantBody {
+			if got := bodies[i][key]; got != want {
+				t.Errorf("attempt %d %s = %v, want %q", i+1, key, got, want)
+			}
+		}
 	}
 }

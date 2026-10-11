@@ -561,9 +561,10 @@ func (h *Handler) DeleteRuntimeProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// App-layer cascade, per runtime, mirroring DeleteAgentRuntime: unbind the
-	// remaining (archived) agents and their task history, cancel anything still
-	// in flight, and hard-delete only the system agents, so removing the runtime
-	// rows below cannot destroy an agent, a conversation or a task record.
+	// remaining (archived) agents and their task history, cancel queued work, and
+	// hard-delete only the system agents. Active Runs must already be stopped and
+	// acknowledged, so removing the runtime rows cannot strand a live execution
+	// or destroy an agent, conversation or task record.
 	var teardowns []service.RuntimeTeardownResult
 	for _, rid := range runtimeIDs {
 		teardown, err := service.TeardownRuntime(r.Context(), qtx, rid, service.RuntimeTeardownOptions{CancelNonTerminalTasks: true})
@@ -572,7 +573,7 @@ func (h *Handler) DeleteRuntimeProfile(w http.ResponseWriter, r *http.Request) {
 				slog.Error("runtime profile delete aborted: tasks not drained",
 					"runtime_id", uuidToString(rid), "profile_id", uuidToString(profileUUID), "error", err)
 				writeJSON(w, http.StatusConflict, map[string]any{
-					"error": "a runtime of this profile still has tasks in flight; retry in a moment.",
+					"error": "a runtime of this profile still has active or stopping Runs. Stop them and wait for their runtime to confirm they have ended before retrying.",
 					"code":  "runtime_delete_not_drained",
 				})
 				return

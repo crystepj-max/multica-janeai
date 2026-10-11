@@ -17,7 +17,7 @@ SET status = 'cancelled', completed_at = now(),
     cancelled_by_type = 'system', cancelled_by_id = NULL, cancelled_by_name = NULL
 WHERE (runtime_id = ANY($1::uuid[]) OR agent_id = ANY($2::uuid[]))
   AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, cancel_ack_pending, dispatch_issue_revision
 `
 
 type CancelAgentTasksByRuntimeOrAgentParams struct {
@@ -116,6 +116,8 @@ func (q *Queries) CancelAgentTasksByRuntimeOrAgent(ctx context.Context, arg Canc
 			&i.CancelledByID,
 			&i.CancelledByName,
 			&i.IssueSnapshot,
+			&i.CancelAckPending,
+			&i.DispatchIssueRevision,
 		); err != nil {
 			return nil, err
 		}
@@ -138,6 +140,27 @@ func (q *Queries) CountActiveAgentsByRuntime(ctx context.Context, runtimeID pgty
 	return count, err
 }
 
+const countTasksAwaitingStopForRuntimeOrAgent = `-- name: CountTasksAwaitingStopForRuntimeOrAgent :one
+SELECT count(*) FROM agent_task_queue
+WHERE (runtime_id = ANY($1::uuid[]) OR agent_id = ANY($2::uuid[]))
+  AND (status IN ('dispatched', 'running', 'waiting_local_directory') OR cancel_ack_pending)
+`
+
+type CountTasksAwaitingStopForRuntimeOrAgentParams struct {
+	RuntimeIds []pgtype.UUID `json:"runtime_ids"`
+	AgentIds   []pgtype.UUID `json:"agent_ids"`
+}
+
+// Runtime teardown may cancel queued work, but it must not delete the runtime
+// while an execution could still be running on that machine. The owner first
+// stops each active Run and waits for its runtime-bound cancellation ack.
+func (q *Queries) CountTasksAwaitingStopForRuntimeOrAgent(ctx context.Context, arg CountTasksAwaitingStopForRuntimeOrAgentParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTasksAwaitingStopForRuntimeOrAgent, arg.RuntimeIds, arg.AgentIds)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countTasksByRuntime = `-- name: CountTasksByRuntime :one
 SELECT count(*) FROM agent_task_queue WHERE runtime_id = $1
 `
@@ -154,7 +177,7 @@ func (q *Queries) CountTasksByRuntime(ctx context.Context, runtimeID pgtype.UUID
 const countUndrainedTasksByRuntimeOrAgent = `-- name: CountUndrainedTasksByRuntimeOrAgent :one
 SELECT count(*) FROM agent_task_queue
 WHERE (runtime_id = ANY($1::uuid[]) OR agent_id = ANY($2::uuid[]))
-  AND completed_at IS NULL
+  AND (completed_at IS NULL OR cancel_ack_pending)
 `
 
 type CountUndrainedTasksByRuntimeOrAgentParams struct {
@@ -164,7 +187,8 @@ type CountUndrainedTasksByRuntimeOrAgentParams struct {
 
 // Belt-and-braces gate for the runtime-delete transaction: after cancelling,
 // every task on this runtime OR owned by an agent being unbound must be terminal
-// (completed_at IS NOT NULL) before the unbind UPDATE runs. The agent-side
+// (completed_at IS NOT NULL) and have no pending stop acknowledgement before the
+// unbind UPDATE runs. The agent-side
 // predicate must mirror CancelAgentTasksByRuntimeOrAgent: a task can remain
 // pinned to another runtime after its agent moves. Non-zero means some
 // non-terminal status escaped the cancel query — the handler aborts with 409
@@ -218,7 +242,7 @@ SET status = 'failed', completed_at = now(), error = 'runtime went offline',
 FROM victims
 WHERE task.id = victims.id
   AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
-RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, task.dispatched_at, task.started_at, task.completed_at, task.result, task.error, task.created_at, task.context, task.runtime_id, task.session_id, task.work_dir, task.trigger_comment_id, task.chat_session_id, task.autopilot_run_id, task.attempt, task.max_attempts, task.parent_task_id, task.failure_reason, task.trigger_summary, task.force_fresh_session, task.is_leader_task, task.wait_reason, task.initiator_user_id, task.handoff_note, task.prepare_lease_expires_at, task.squad_id, task.runtime_mcp_overlay, task.escalation_for_task_id, task.fire_at, task.originator_user_id, task.runtime_connected_apps, task.coalesced_comment_ids, task.delivered_comment_ids, task.chat_input_task_id, task.chat_finalize_deferred_at, task.originator_source, task.delegated_from_task_id, task.retry_of_task_id, task.rerun_of_task_id, task.rule_version_id, task.trigger_evidence_kind, task.trigger_evidence_ref_id, task.accountable_user_id, task.session_rollout_missing, task.retired_session_id, task.quick_actions_disabled, task.regenerate_quick_actions_for, task.branch_name, task.durable_work_dir, task.channel_context_revision, task.comment_thread_id, task.cancelled_by_type, task.cancelled_by_id, task.cancelled_by_name, task.issue_snapshot
+RETURNING task.id, task.agent_id, task.issue_id, task.status, task.priority, task.dispatched_at, task.started_at, task.completed_at, task.result, task.error, task.created_at, task.context, task.runtime_id, task.session_id, task.work_dir, task.trigger_comment_id, task.chat_session_id, task.autopilot_run_id, task.attempt, task.max_attempts, task.parent_task_id, task.failure_reason, task.trigger_summary, task.force_fresh_session, task.is_leader_task, task.wait_reason, task.initiator_user_id, task.handoff_note, task.prepare_lease_expires_at, task.squad_id, task.runtime_mcp_overlay, task.escalation_for_task_id, task.fire_at, task.originator_user_id, task.runtime_connected_apps, task.coalesced_comment_ids, task.delivered_comment_ids, task.chat_input_task_id, task.chat_finalize_deferred_at, task.originator_source, task.delegated_from_task_id, task.retry_of_task_id, task.rerun_of_task_id, task.rule_version_id, task.trigger_evidence_kind, task.trigger_evidence_ref_id, task.accountable_user_id, task.session_rollout_missing, task.retired_session_id, task.quick_actions_disabled, task.regenerate_quick_actions_for, task.branch_name, task.durable_work_dir, task.channel_context_revision, task.comment_thread_id, task.cancelled_by_type, task.cancelled_by_id, task.cancelled_by_name, task.issue_snapshot, task.cancel_ack_pending, task.dispatch_issue_revision
 `
 
 type FailTasksForOfflineRuntimesParams struct {
@@ -303,6 +327,8 @@ func (q *Queries) FailTasksForOfflineRuntimes(ctx context.Context, arg FailTasks
 			&i.CancelledByID,
 			&i.CancelledByName,
 			&i.IssueSnapshot,
+			&i.CancelAckPending,
+			&i.DispatchIssueRevision,
 		); err != nil {
 			return nil, err
 		}
@@ -1333,7 +1359,7 @@ func (q *Queries) TouchAgentRuntimesLastSeenBatch(ctx context.Context, ids []pgt
 const unbindTasksFromRuntime = `-- name: UnbindTasksFromRuntime :execrows
 UPDATE agent_task_queue
 SET runtime_id = NULL
-WHERE runtime_id = $1 AND completed_at IS NOT NULL
+WHERE runtime_id = $1 AND completed_at IS NOT NULL AND NOT cancel_ack_pending
 `
 
 // Detaches this runtime's task history so deleting the runtime row cannot

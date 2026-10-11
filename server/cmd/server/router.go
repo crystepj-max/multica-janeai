@@ -2022,6 +2022,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements", h.CreateTaskSupplement)
 					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements/{commentId}/retry", h.RetryTaskSupplement)
 					r.Post("/rerun", h.RerunIssue)
+					r.Post("/dispatch", h.DispatchIssue)
 					r.Post("/quick-actions/{quickActionId}/run", h.RunQuickAction)
 					r.Post("/quick-actions/{quickActionId}/render", h.RenderQuickAction)
 					r.Get("/task-runs", h.ListTasksByIssue)

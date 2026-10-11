@@ -203,6 +203,7 @@ func TestRerunIssue_PrivateHistoricalAgent(t *testing.T) {
 	// A historical task run by the private agent.
 	orig, err := testHandler.TaskService.EnqueueTaskForIssue(ctx, db.Issue{
 		ID:           util.MustParseUUID(issueID),
+		Revision:     1,
 		AssigneeID:   util.MustParseUUID(agentID),
 		Priority:     "medium",
 		CreatorType:  "member",

@@ -961,6 +961,67 @@ func TestDeleteMember_RevokesTargetRuntimes(t *testing.T) {
 	assertRevoked(t, fx)
 }
 
+func TestDeleteMember_WaitsForRunCancellationAck(t *testing.T) {
+	fx := setupRevocationFixture(t, "handler-tests-revoke-drain", "daemon-revoke-drain")
+	ctx := context.Background()
+	issueID := dbfx.Issue(t, "Revocation drain issue", testutil.Cols{"workspace_id": fx.WorkspaceID})
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET issue_id = $2, status = 'running', started_at = now()
+		WHERE id = $1
+	`, fx.TaskID, issueID); err != nil {
+		t.Fatalf("set fixture task running: %v", err)
+	}
+
+	deleteMember := func() *testutil.Response {
+		req := newRequest("DELETE", "/api/workspaces/"+fx.WorkspaceID+"/members/"+fx.MemberID, nil)
+		req.Header.Set("X-Workspace-ID", fx.WorkspaceID)
+		req = withURLParams(req, "id", fx.WorkspaceID, "memberId", fx.MemberID)
+		return testutil.Call(t, testHandler.DeleteMember, req)
+	}
+	checkBlocked := func() {
+		t.Helper()
+		response := deleteMember().Want(http.StatusConflict)
+		if got := response.Map()["code"]; got != "workspace_member_runs_not_drained" {
+			t.Fatalf("blocked member removal code = %v, want workspace_member_runs_not_drained", got)
+		}
+		var memberExists, tokenExists bool
+		if err := testPool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM member WHERE id = $1)`, fx.MemberID).Scan(&memberExists); err != nil {
+			t.Fatalf("check member after blocked removal: %v", err)
+		}
+		if err := testPool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM daemon_token WHERE token_hash = $1)`, fx.TokenHash).Scan(&tokenExists); err != nil {
+			t.Fatalf("check daemon token after blocked removal: %v", err)
+		}
+		if !memberExists || !tokenExists {
+			t.Fatalf("blocked removal changed access state: member=%v daemon_token=%v", memberExists, tokenExists)
+		}
+	}
+
+	// A running task must make member removal roll back without revoking the
+	// identity the runtime needs to receive and acknowledge a stop request.
+	checkBlocked()
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, fx.TaskID).Scan(&status); err != nil {
+		t.Fatalf("read task after rolled-back removal: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("task after rolled-back removal = %q, want running", status)
+	}
+
+	if _, err := testHandler.TaskService.CancelTask(ctx, parseUUID(fx.TaskID)); err != nil {
+		t.Fatalf("stop active task: %v", err)
+	}
+	checkBlocked() // A cancelled row still reserves capacity until its ACK.
+
+	ackReq := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+fx.TaskID+"/cancel-ack", nil,
+		fx.WorkspaceID, fx.DaemonID)
+	ackReq = withURLParam(ackReq, "taskId", fx.TaskID)
+	testutil.Call(t, testHandler.AckTaskCancelled, ackReq).Want(http.StatusOK)
+
+	deleteMember().Want(http.StatusNoContent)
+	assertRevoked(t, fx)
+}
+
 // TestDeleteMember_PrunesChannelUserBindings verifies the application-layer
 // replacement for the channel_user_binding member-FK cascade (MUL-3515 §4):
 // removing a member prunes that member's channel bindings, in the same tx as

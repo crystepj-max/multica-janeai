@@ -341,6 +341,8 @@ var concurrentIndexCleanups = map[string]string{
 	"482_agent_task_queue_telemetry_started_index":              "idx_agent_task_queue_telemetry_started",
 	"484_issue_triage_state_index":                              "idx_issue_triage_state",
 	"537_issue_duplicate_of_index":                              "idx_issue_duplicate_of",
+	"554_issue_dispatch_request_idempotency_index":              "idx_issue_dispatch_request_workspace_key",
+	"556_issue_task_dispatch_revision_index":                    "idx_agent_task_issue_dispatch_revision",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction

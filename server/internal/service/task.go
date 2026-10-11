@@ -39,11 +39,14 @@ import (
 type TaskService struct {
 	Queries   *db.Queries
 	TxStarter TxStarter
-	Hub       *realtime.Hub
-	Bus       *events.Bus
-	Analytics analytics.Client
-	Metrics   *obsmetrics.BusinessMetrics
-	Wakeup    TaskWakeupNotifier
+	// deferEnqueueEvents is set only on a transaction-scoped service while an
+	// idempotent dispatch is being committed. The caller publishes after commit.
+	deferEnqueueEvents bool
+	Hub                *realtime.Hub
+	Bus                *events.Bus
+	Analytics          analytics.Client
+	Metrics            *obsmetrics.BusinessMetrics
+	Wakeup             TaskWakeupNotifier
 	// Entitlements supplies Cloud's workspace-scoped issue-count instruction.
 	// Nil keeps self-hosted and isolated test services unlimited.
 	Entitlements entitlement.Provider
@@ -735,6 +738,12 @@ func isDuplicatePendingTaskErr(err error) bool {
 	}
 }
 
+func isDuplicateIssueTaskDispatchRevisionErr(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		pgErr.ConstraintName == "idx_agent_task_issue_dispatch_revision"
+}
+
 // pendingSlotTakenErr reports whether err means "the (issue, agent) pending slot
 // was already occupied when we tried to enqueue".
 //
@@ -1123,6 +1132,10 @@ func (s *TaskService) EnqueueTaskForIssue(ctx context.Context, issue db.Issue, t
 	if len(triggerCommentID) > 0 {
 		commentID = triggerCommentID[0]
 	}
+	if !commentID.Valid {
+		task, _, err := s.EnqueueTaskForIssueRunTrigger(ctx, issue, "", pgtype.UUID{})
+		return task, err
+	}
 	return s.enqueueIssueTask(ctx, issue, commentID, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived)
 }
 
@@ -1189,7 +1202,24 @@ func (s *TaskService) hydrateDeferredChannelIssueTaskOverlay(ctx context.Context
 // assign/promote and becomes the accountable human for the run (MUL-4302 §4);
 // invalid when the caller has no member actor.
 func (s *TaskService) EnqueueTaskForIssueByActor(ctx context.Context, issue db.Issue, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
-	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", actorUserID, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived)
+	task, _, err := s.EnqueueTaskForIssueRunTrigger(ctx, issue, "", actorUserID)
+	return task, err
+}
+
+// EnqueueTaskForIssueRunTrigger marks the Multica status/assignment-triggered
+// run with the issue revision that caused it. Explicit dev-flow dispatch uses
+// the same marker so the database can coalesce both entry points atomically.
+func (s *TaskService) EnqueueTaskForIssueRunTrigger(ctx context.Context, issue db.Issue, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, bool, error) {
+	dispatchRevision := issueDispatchRevision(issue)
+	if !dispatchRevision.Valid {
+		return db.AgentTaskQueue{}, false, ErrIssueDispatchRevisionRequired
+	}
+	var reused bool
+	task, err := s.enqueueIssueTaskWithCommentPlanAndDispatchRevision(
+		ctx, issue, pgtype.UUID{}, nil, false, handoffNote, actorUserID, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived,
+		dispatchRevision, &reused,
+	)
+	return task, reused, err
 }
 
 // EnqueueTaskForIssueWithHandoff is the backward-compatible assign/promote
@@ -1197,7 +1227,8 @@ func (s *TaskService) EnqueueTaskForIssueByActor(ctx context.Context, issue db.I
 // persisted on the task so both old and current daemons can render it in the
 // run's opening prompt. Empty text behaves like EnqueueTaskForIssueByActor.
 func (s *TaskService) EnqueueTaskForIssueWithHandoff(ctx context.Context, issue db.Issue, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
-	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, handoffNote, actorUserID, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived)
+	task, _, err := s.EnqueueTaskForIssueRunTrigger(ctx, issue, handoffNote, actorUserID)
+	return task, err
 }
 
 // enqueueIssueTask is the shared implementation behind EnqueueTaskForIssue
@@ -1238,6 +1269,10 @@ func headShaText(sha string) pgtype.Text {
 	return pgtype.Text{String: sha, Valid: sha != ""}
 }
 
+func issueDispatchRevision(issue db.Issue) pgtype.Int8 {
+	return pgtype.Int8{Int64: issue.Revision, Valid: issue.Revision > 0}
+}
+
 // ResolveIssueReviewSHAParam is ResolveIssueReviewSHA wrapped as the pgtype.Text
 // the dedup queries take, so both service- and handler-package call sites can
 // key dedup on the reviewed head with a single call (TEN-356).
@@ -1250,6 +1285,10 @@ func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, trig
 }
 
 func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin) (db.AgentTaskQueue, error) {
+	return s.enqueueIssueTaskWithCommentPlanAndDispatchRevision(ctx, issue, triggerCommentID, coalescedCommentIDs, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, fireAt, origin, pgtype.Int8{}, nil)
+}
+
+func (s *TaskService) enqueueIssueTaskWithCommentPlanAndDispatchRevision(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin, dispatchRevision pgtype.Int8, reused *bool) (db.AgentTaskQueue, error) {
 	if !issue.AssigneeID.Valid {
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", "issue has no assignee")
 		return db.AgentTaskQueue{}, fmt.Errorf("issue has no assignee")
@@ -1271,6 +1310,23 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", "agent has no runtime")
 		return db.AgentTaskQueue{}, fmt.Errorf("agent has no runtime")
 	}
+	if dispatchRevision.Valid {
+		existing, lookupErr := s.Queries.GetIssueTaskForDispatchRevision(ctx, db.GetIssueTaskForDispatchRevisionParams{
+			IssueID: issue.ID, AgentID: agent.ID, DispatchIssueRevision: dispatchRevision,
+		})
+		if lookupErr == nil {
+			if reused != nil {
+				*reused = true
+			}
+			if !s.deferEnqueueEvents {
+				s.publishIssueDispatchResult(ctx, existing, true)
+			}
+			return existing, nil
+		}
+		if !errors.Is(lookupErr, pgx.ErrNoRows) {
+			return db.AgentTaskQueue{}, fmt.Errorf("check issue dispatch revision: %w", lookupErr)
+		}
+	}
 
 	// The issue assignee reacting to an agent-authored comment is a
 	// comment_source attribution (a special case of delegation); a member
@@ -1289,26 +1345,27 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	createParams := db.CreateAgentTaskParams{
-		ID:                   dbid.NewV7(),
-		AgentID:              issue.AssigneeID,
-		RuntimeID:            agent.RuntimeID,
-		IssueID:              issue.ID,
-		Priority:             priorityToInt(issue.Priority),
-		TriggerCommentID:     triggerCommentID,
-		CoalescedCommentIds:  coalescedCommentIDs,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
-		ForceFreshSession:    pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
-		HandoffNote:          pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
-		OriginatorUserID:     originatorUserID,
-		AccountableUserID:    attr.AccountableUserID,
-		RuleVersionID:        attr.RuleVersionID,
-		RerunOfTaskID:        rerunOfTaskID,
-		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
-		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
+		ID:                    dbid.NewV7(),
+		AgentID:               issue.AssigneeID,
+		RuntimeID:             agent.RuntimeID,
+		IssueID:               issue.ID,
+		Priority:              priorityToInt(issue.Priority),
+		TriggerCommentID:      triggerCommentID,
+		CoalescedCommentIds:   coalescedCommentIDs,
+		TriggerSummary:        s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+		ForceFreshSession:     pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
+		HandoffNote:           pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
+		OriginatorUserID:      originatorUserID,
+		AccountableUserID:     attr.AccountableUserID,
+		RuleVersionID:         attr.RuleVersionID,
+		RerunOfTaskID:         rerunOfTaskID,
+		RuntimeMcpOverlay:     runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps:  runtimeMCPOverlay.ConnectedApps,
+		OriginatorSource:      attrSource,
+		DelegatedFromTaskID:   attrDelegatedFrom,
+		TriggerEvidenceKind:   attrEvidenceKind,
+		TriggerEvidenceRefID:  attrEvidenceRef,
+		DispatchIssueRevision: dispatchRevision,
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1345,6 +1402,23 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		task, err = s.Queries.CreateAgentTask(ctx, createParams)
 	}
 	if err != nil {
+		if dispatchRevision.Valid && (errors.Is(err, pgx.ErrNoRows) || isDuplicateIssueTaskDispatchRevisionErr(err)) {
+			existing, lookupErr := s.Queries.GetIssueTaskForDispatchRevision(ctx, db.GetIssueTaskForDispatchRevisionParams{
+				IssueID: issue.ID, AgentID: agent.ID, DispatchIssueRevision: dispatchRevision,
+			})
+			if lookupErr == nil {
+				if reused != nil {
+					*reused = true
+				}
+				if !s.deferEnqueueEvents {
+					s.publishIssueDispatchResult(ctx, existing, true)
+				}
+				return existing, nil
+			}
+			if !errors.Is(lookupErr, pgx.ErrNoRows) {
+				return db.AgentTaskQueue{}, fmt.Errorf("load issue task for dispatch revision: %w", lookupErr)
+			}
+		}
 		// A concurrent enqueue for the same (issue, agent) won the race and the
 		// unique index rejected this insert. That is benign — a sibling run
 		// already covers this target — so log it at debug and return a typed
@@ -1366,6 +1440,9 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		"force_fresh_session", forceFreshSession,
 	)
 	if fireAt.Valid {
+		return task, nil
+	}
+	if s.deferEnqueueEvents {
 		return task, nil
 	}
 	// Order matters: broadcast first, notify daemon second. notifyTaskAvailable
@@ -1405,6 +1482,10 @@ func (s *TaskService) EnqueueTaskForThreadParent(ctx context.Context, issue db.I
 // leader task was triggered (comment @squad, issue assign, autopilot,
 // sub-issue done callback). See migration 127.
 func (s *TaskService) EnqueueTaskForSquadLeader(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, triggerCommentID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, error) {
+	if !triggerCommentID.Valid {
+		task, _, err := s.enqueueTaskForSquadLeaderRunTrigger(ctx, issue, leaderID, squadID, "", pgtype.UUID{}, origin)
+		return task, err
+	}
 	return s.enqueueMentionTask(ctx, issue, leaderID, triggerCommentID, true, squadID, false, "", pgtype.UUID{}, pgtype.UUID{}, origin)
 }
 
@@ -1413,13 +1494,32 @@ func (s *TaskService) EnqueueTaskForSquadLeader(ctx context.Context, issue db.Is
 // assign/promote and becomes the accountable human (MUL-4302 §4); invalid when
 // the caller has no member actor.
 func (s *TaskService) EnqueueTaskForSquadLeaderByActor(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
-	return s.enqueueMentionTask(ctx, issue, leaderID, pgtype.UUID{}, true, squadID, false, "", actorUserID, pgtype.UUID{}, OriginDerived)
+	task, _, err := s.EnqueueTaskForSquadLeaderRunTriggerWithHandoff(ctx, issue, leaderID, squadID, "", actorUserID)
+	return task, err
 }
 
 // EnqueueTaskForSquadLeaderWithHandoff is the squad equivalent of
 // EnqueueTaskForIssueWithHandoff.
 func (s *TaskService) EnqueueTaskForSquadLeaderWithHandoff(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
-	return s.enqueueMentionTask(ctx, issue, leaderID, pgtype.UUID{}, true, squadID, false, handoffNote, actorUserID, pgtype.UUID{}, OriginDerived)
+	task, _, err := s.EnqueueTaskForSquadLeaderRunTriggerWithHandoff(ctx, issue, leaderID, squadID, handoffNote, actorUserID)
+	return task, err
+}
+
+func (s *TaskService) EnqueueTaskForSquadLeaderRunTriggerWithHandoff(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, bool, error) {
+	return s.enqueueTaskForSquadLeaderRunTrigger(ctx, issue, leaderID, squadID, handoffNote, actorUserID, OriginDerived)
+}
+
+func (s *TaskService) enqueueTaskForSquadLeaderRunTrigger(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, handoffNote string, actorUserID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, bool, error) {
+	dispatchRevision := issueDispatchRevision(issue)
+	if !dispatchRevision.Valid {
+		return db.AgentTaskQueue{}, false, ErrIssueDispatchRevisionRequired
+	}
+	var reused bool
+	task, err := s.enqueueMentionTaskWithCommentPlanAndDispatchRevision(
+		ctx, issue, leaderID, pgtype.UUID{}, nil, true, squadID, false, handoffNote, actorUserID, pgtype.UUID{}, origin,
+		dispatchRevision, &reused,
+	)
+	return task, reused, err
 }
 
 func (s *TaskService) enqueueMentionTask(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, error) {
@@ -1427,6 +1527,10 @@ func (s *TaskService) enqueueMentionTask(ctx context.Context, issue db.Issue, ag
 }
 
 func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, error) {
+	return s.enqueueMentionTaskWithCommentPlanAndDispatchRevision(ctx, issue, agentID, triggerCommentID, coalescedCommentIDs, isLeader, squadID, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, origin, pgtype.Int8{}, nil)
+}
+
+func (s *TaskService) enqueueMentionTaskWithCommentPlanAndDispatchRevision(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin, dispatchRevision pgtype.Int8, reused *bool) (db.AgentTaskQueue, error) {
 	if err := guardIssueNotInTriage(ctx, s.Queries, issue.ID, origin); err != nil {
 		return db.AgentTaskQueue{}, err
 	}
@@ -1442,6 +1546,23 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	if !agent.RuntimeID.Valid {
 		slog.Error("mention task enqueue failed: agent has no runtime", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID))
 		return db.AgentTaskQueue{}, fmt.Errorf("agent has no runtime")
+	}
+	if dispatchRevision.Valid {
+		existing, lookupErr := s.Queries.GetIssueTaskForDispatchRevision(ctx, db.GetIssueTaskForDispatchRevisionParams{
+			IssueID: issue.ID, AgentID: agent.ID, DispatchIssueRevision: dispatchRevision,
+		})
+		if lookupErr == nil {
+			if reused != nil {
+				*reused = true
+			}
+			if !s.deferEnqueueEvents {
+				s.publishIssueDispatchResult(ctx, existing, true)
+			}
+			return existing, nil
+		}
+		if !errors.Is(lookupErr, pgx.ErrNoRows) {
+			return db.AgentTaskQueue{}, fmt.Errorf("check issue dispatch revision: %w", lookupErr)
+		}
 	}
 
 	// An explicit mention / thread-parent / squad-leader hop from an
@@ -1460,33 +1581,51 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
-		ID:                   dbid.NewV7(),
-		AgentID:              agentID,
-		RuntimeID:            agent.RuntimeID,
-		IssueID:              issue.ID,
-		Priority:             priorityToInt(issue.Priority),
-		TriggerCommentID:     triggerCommentID,
-		CoalescedCommentIds:  coalescedCommentIDs,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
-		IsLeaderTask:         pgtype.Bool{Bool: isLeader, Valid: isLeader},
-		ForceFreshSession:    pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
-		HandoffNote:          pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
-		SquadID:              squadID,
-		OriginatorUserID:     originatorUserID,
-		AccountableUserID:    attr.AccountableUserID,
-		RuleVersionID:        attr.RuleVersionID,
-		RerunOfTaskID:        rerunOfTaskID,
-		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
-		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
+		ID:                    dbid.NewV7(),
+		AgentID:               agentID,
+		RuntimeID:             agent.RuntimeID,
+		IssueID:               issue.ID,
+		Priority:              priorityToInt(issue.Priority),
+		TriggerCommentID:      triggerCommentID,
+		CoalescedCommentIds:   coalescedCommentIDs,
+		TriggerSummary:        s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+		IsLeaderTask:          pgtype.Bool{Bool: isLeader, Valid: isLeader},
+		ForceFreshSession:     pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
+		HandoffNote:           pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
+		SquadID:               squadID,
+		OriginatorUserID:      originatorUserID,
+		AccountableUserID:     attr.AccountableUserID,
+		RuleVersionID:         attr.RuleVersionID,
+		RerunOfTaskID:         rerunOfTaskID,
+		RuntimeMcpOverlay:     runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps:  runtimeMCPOverlay.ConnectedApps,
+		OriginatorSource:      attrSource,
+		DelegatedFromTaskID:   attrDelegatedFrom,
+		TriggerEvidenceKind:   attrEvidenceKind,
+		TriggerEvidenceRefID:  attrEvidenceRef,
+		DispatchIssueRevision: dispatchRevision,
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
 	})
 	if err != nil {
+		if dispatchRevision.Valid && (errors.Is(err, pgx.ErrNoRows) || isDuplicateIssueTaskDispatchRevisionErr(err)) {
+			existing, lookupErr := s.Queries.GetIssueTaskForDispatchRevision(ctx, db.GetIssueTaskForDispatchRevisionParams{
+				IssueID: issue.ID, AgentID: agent.ID, DispatchIssueRevision: dispatchRevision,
+			})
+			if lookupErr == nil {
+				if reused != nil {
+					*reused = true
+				}
+				if !s.deferEnqueueEvents {
+					s.publishIssueDispatchResult(ctx, existing, true)
+				}
+				return existing, nil
+			}
+			if !errors.Is(lookupErr, pgx.ErrNoRows) {
+				return db.AgentTaskQueue{}, fmt.Errorf("load issue task for dispatch revision: %w", lookupErr)
+			}
+		}
 		// A concurrent enqueue for the same (issue, agent) won the race and the
 		// unique index rejected this insert. That is benign — a sibling run
 		// already covers this target — so log it at debug and return a typed
@@ -1501,6 +1640,9 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	}
 
 	slog.Info("mention task enqueued", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "is_leader_task", isLeader)
+	if s.deferEnqueueEvents {
+		return task, nil
+	}
 	// See EnqueueTaskForIssue for ordering rationale.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 	s.NotifyTaskEnqueued(ctx, task)
@@ -7137,6 +7279,19 @@ func (s *TaskService) NotifyTaskEnqueued(ctx context.Context, task db.AgentTaskQ
 func (s *TaskService) NotifyTaskFinished(task db.AgentTaskQueue) {
 	s.forgetTaskReclaim(task)
 	s.notifyRuntimeMayHaveWork(task.RuntimeID, "")
+}
+
+// NotifyAgentCurrentRuntimeMayHaveWork wakes the runtime currently bound to an
+// agent after a prior run's cancellation acknowledgement releases its capacity.
+// The acknowledged task may belong to an older runtime after an agent rebind.
+func (s *TaskService) NotifyAgentCurrentRuntimeMayHaveWork(ctx context.Context, agentID pgtype.UUID) {
+	agent, err := s.Queries.GetAgent(ctx, agentID)
+	if err != nil {
+		slog.Warn("load agent runtime after cancellation acknowledgement failed",
+			"agent_id", util.UUIDToString(agentID), "error", err)
+		return
+	}
+	s.notifyRuntimeMayHaveWork(agent.RuntimeID, "")
 }
 
 // notifyTasksFinished is the batch form used by bulk terminal transitions.

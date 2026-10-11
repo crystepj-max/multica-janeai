@@ -5881,7 +5881,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			ack.ErrorMessage = preserved.Error()
 			ack.FailureReason = "local_directory_error"
 		}
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, ack); ackErr != nil {
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, d.cfg.DaemonID, ack); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return
@@ -5930,7 +5930,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// completed/failed rows the complete/fail callback is the
 		// authoritative channel and a stale run's late ack must not touch
 		// them.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}); ackErr != nil {
+		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, d.cfg.DaemonID, TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
 		return

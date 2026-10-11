@@ -102,6 +102,15 @@ multica issue comment update <comment-id> --expected-revision 2 --content "Check
 multica issue runs MUL-123
 ```
 
+Queue a run for a `todo` issue assigned to an agent or squad. Read the current revision first:
+
+```bash
+multica issue get MUL-123 --output json
+multica issue dispatch MUL-123 --idempotency-key batch-42-MUL-123 --expected-revision 7
+```
+
+Use the same key and revision if the response is uncertain; Multica returns the original run instead of queueing another one. A stale revision is rejected with `409 revision_conflict`, so reload the issue and review the changed plan before dispatching again. Dispatch is also refused while the assigned target has an active or queued run for that issue.
+
 Read long descriptions or comments from stdin to avoid dealing with newlines and quoting:
 
 ```bash
@@ -253,6 +262,7 @@ The tables below cover every current top-level command, grouped the way the CLI 
 | | `run-messages <task-id>` | View the messages of a single run | `--since`, `--issue` |
 | | `usage <issue-id>` | View aggregated token usage | |
 | | `rerun <id>` | Re-enqueue a run for the current assignee | |
+| | `dispatch <id>` | Queue one run for a `todo` issue with retry-safe request identity | `--idempotency-key` (reuse on retry), `--expected-revision` (positive revision from `issue get`) |
 | | `cancel-task <task-id>` | Cancel a running or queued run | `--issue` |
 | `project` | `list/get/create/update/delete` | Manage projects | |
 | | `status <id> <status>` | Change project status | |
