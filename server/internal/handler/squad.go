@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/service"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -713,9 +713,13 @@ func (h *Handler) ListSquadMemberStatus(w http.ResponseWriter, r *http.Request) 
 			}
 
 			if row.TaskIssueID.Valid {
+				code := ""
+				if row.IssueNumberCode.Valid {
+					code = row.IssueNumberCode.String
+				}
 				brief := SquadActiveIssueBrief{
 					IssueID:    uuidToString(row.TaskIssueID),
-					Identifier: prefix + "-" + strconv.Itoa(int(row.IssueNumber.Int32)),
+					Identifier: service.IssueIdentifier(prefix, code, row.IssueNumber.Int32),
 					Title:      row.IssueTitle.String,
 					IssueStatus: func() string {
 						if row.IssueStatus.Valid {

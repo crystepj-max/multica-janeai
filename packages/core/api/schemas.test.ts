@@ -1565,6 +1565,24 @@ describe("SearchProjectsResponseSchema date drift", () => {
     expect(parsed.projects[0]?.start_date).toBeNull();
     expect(parsed.projects[0]?.due_date).toBeNull();
   });
+
+  it("parses the project code and defaults it to empty on older backends", () => {
+    const withCode = parseWithFallback(
+      { projects: [{ ...baseProject, code: "QTZ" }], total: 1 },
+      SearchProjectsResponseSchema,
+      EMPTY_SEARCH_PROJECTS_RESPONSE,
+      ENDPOINT,
+    );
+    expect(withCode.projects[0]?.code).toBe("QTZ");
+
+    const withoutCode = parseWithFallback(
+      { projects: [baseProject], total: 1 },
+      SearchProjectsResponseSchema,
+      EMPTY_SEARCH_PROJECTS_RESPONSE,
+      ENDPOINT,
+    );
+    expect(withoutCode.projects[0]?.code).toBe("");
+  });
 });
 
 // The "run now" flow branches on run.status/reason_code to avoid a false-success

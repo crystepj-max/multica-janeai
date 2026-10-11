@@ -26,10 +26,10 @@ func (q *Queries) CountIssuesByProject(ctx context.Context, projectID pgtype.UUI
 const createProject = `-- name: CreateProject :one
 INSERT INTO project (
     workspace_id, title, description, icon, status,
-    lead_type, lead_id, priority, start_date, due_date
+    lead_type, lead_id, priority, start_date, due_date, code
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-) RETURNING id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+) RETURNING id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date, code, issue_counter
 `
 
 type CreateProjectParams struct {
@@ -43,6 +43,7 @@ type CreateProjectParams struct {
 	Priority    string      `json:"priority"`
 	StartDate   pgtype.Date `json:"start_date"`
 	DueDate     pgtype.Date `json:"due_date"`
+	Code        string      `json:"code"`
 }
 
 func (q *Queries) CreateProject(ctx context.Context, arg CreateProjectParams) (Project, error) {
@@ -57,6 +58,7 @@ func (q *Queries) CreateProject(ctx context.Context, arg CreateProjectParams) (P
 		arg.Priority,
 		arg.StartDate,
 		arg.DueDate,
+		arg.Code,
 	)
 	var i Project
 	err := row.Scan(
@@ -73,6 +75,8 @@ func (q *Queries) CreateProject(ctx context.Context, arg CreateProjectParams) (P
 		&i.Priority,
 		&i.StartDate,
 		&i.DueDate,
+		&i.Code,
+		&i.IssueCounter,
 	)
 	return i, err
 }
@@ -93,7 +97,7 @@ func (q *Queries) DeleteProject(ctx context.Context, arg DeleteProjectParams) er
 }
 
 const getProjectInWorkspace = `-- name: GetProjectInWorkspace :one
-SELECT id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date FROM project
+SELECT id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date, code, issue_counter FROM project
 WHERE id = $1 AND workspace_id = $2
 `
 
@@ -119,6 +123,8 @@ func (q *Queries) GetProjectInWorkspace(ctx context.Context, arg GetProjectInWor
 		&i.Priority,
 		&i.StartDate,
 		&i.DueDate,
+		&i.Code,
+		&i.IssueCounter,
 	)
 	return i, err
 }
@@ -165,8 +171,21 @@ func (q *Queries) GetProjectIssueStats(ctx context.Context, arg GetProjectIssueS
 	return items, nil
 }
 
+const incrementProjectIssueCounter = `-- name: IncrementProjectIssueCounter :one
+UPDATE project SET issue_counter = issue_counter + 1
+WHERE id = $1
+RETURNING issue_counter
+`
+
+func (q *Queries) IncrementProjectIssueCounter(ctx context.Context, id pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, incrementProjectIssueCounter, id)
+	var issue_counter int32
+	err := row.Scan(&issue_counter)
+	return issue_counter, err
+}
+
 const listProjects = `-- name: ListProjects :many
-SELECT id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date FROM project
+SELECT id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date, code, issue_counter FROM project
 WHERE workspace_id = $1
   AND ($2::text IS NULL OR status = $2)
   AND ($3::text IS NULL OR priority = $3)
@@ -202,6 +221,8 @@ func (q *Queries) ListProjects(ctx context.Context, arg ListProjectsParams) ([]P
 			&i.Priority,
 			&i.StartDate,
 			&i.DueDate,
+			&i.Code,
+			&i.IssueCounter,
 		); err != nil {
 			return nil, err
 		}
@@ -253,6 +274,43 @@ func (q *Queries) LockProjectForDelete(ctx context.Context, arg LockProjectForDe
 	return id, err
 }
 
+const setProjectCodeIfEmpty = `-- name: SetProjectCodeIfEmpty :one
+UPDATE project SET code = $2
+WHERE id = $1 AND code = ''
+RETURNING id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date, code, issue_counter
+`
+
+type SetProjectCodeIfEmptyParams struct {
+	ID   pgtype.UUID `json:"id"`
+	Code string      `json:"code"`
+}
+
+// Claims a lazily derived code for a legacy project. Returns no rows when
+// another transaction already assigned a code; the caller must then re-read
+// the project row and use the winner's code.
+func (q *Queries) SetProjectCodeIfEmpty(ctx context.Context, arg SetProjectCodeIfEmptyParams) (Project, error) {
+	row := q.db.QueryRow(ctx, setProjectCodeIfEmpty, arg.ID, arg.Code)
+	var i Project
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Title,
+		&i.Description,
+		&i.Icon,
+		&i.Status,
+		&i.LeadType,
+		&i.LeadID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Priority,
+		&i.StartDate,
+		&i.DueDate,
+		&i.Code,
+		&i.IssueCounter,
+	)
+	return i, err
+}
+
 const updateProject = `-- name: UpdateProject :one
 UPDATE project SET
     title = COALESCE($2, title),
@@ -264,9 +322,10 @@ UPDATE project SET
     lead_id = $8,
     start_date = $9,
     due_date = $10,
+    code = COALESCE($11, code),
     updated_at = now()
 WHERE id = $1
-RETURNING id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date
+RETURNING id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority, start_date, due_date, code, issue_counter
 `
 
 type UpdateProjectParams struct {
@@ -280,6 +339,7 @@ type UpdateProjectParams struct {
 	LeadID      pgtype.UUID `json:"lead_id"`
 	StartDate   pgtype.Date `json:"start_date"`
 	DueDate     pgtype.Date `json:"due_date"`
+	Code        pgtype.Text `json:"code"`
 }
 
 func (q *Queries) UpdateProject(ctx context.Context, arg UpdateProjectParams) (Project, error) {
@@ -294,6 +354,7 @@ func (q *Queries) UpdateProject(ctx context.Context, arg UpdateProjectParams) (P
 		arg.LeadID,
 		arg.StartDate,
 		arg.DueDate,
+		arg.Code,
 	)
 	var i Project
 	err := row.Scan(
@@ -310,6 +371,8 @@ func (q *Queries) UpdateProject(ctx context.Context, arg UpdateProjectParams) (P
 		&i.Priority,
 		&i.StartDate,
 		&i.DueDate,
+		&i.Code,
+		&i.IssueCounter,
 	)
 	return i, err
 }

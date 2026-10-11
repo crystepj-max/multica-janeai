@@ -660,7 +660,7 @@ func TestClaimTaskByRuntime_PopulatesWorkspaceContext(t *testing.T) {
 	if resp.Task.WorkspaceSlug != workspaceSlug {
 		t.Errorf("workspace_slug = %q, want %q", resp.Task.WorkspaceSlug, workspaceSlug)
 	}
-	if want := service.IssueIdentifier(issuePrefix, issueNumber); resp.Task.IssueIdentifier != want {
+	if want := service.IssueIdentifier(issuePrefix, "", issueNumber); resp.Task.IssueIdentifier != want {
 		t.Errorf("issue_identifier = %q, want %q", resp.Task.IssueIdentifier, want)
 	}
 }

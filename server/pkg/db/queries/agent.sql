@@ -2550,6 +2550,7 @@ SELECT
     atq.started_at,
     w.issue_prefix,
     i.number AS issue_number,
+    i.number_code AS issue_number_code,
     i.title AS issue_title
 FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id

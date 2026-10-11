@@ -26,9 +26,9 @@ FOR UPDATE;
 -- name: CreateProject :one
 INSERT INTO project (
     workspace_id, title, description, icon, status,
-    lead_type, lead_id, priority, start_date, due_date
+    lead_type, lead_id, priority, start_date, due_date, code
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 ) RETURNING *;
 
 -- name: UpdateProject :one
@@ -42,8 +42,22 @@ UPDATE project SET
     lead_id = sqlc.narg('lead_id'),
     start_date = sqlc.narg('start_date'),
     due_date = sqlc.narg('due_date'),
+    code = COALESCE(sqlc.narg('code'), code),
     updated_at = now()
 WHERE id = $1
+RETURNING *;
+
+-- name: IncrementProjectIssueCounter :one
+UPDATE project SET issue_counter = issue_counter + 1
+WHERE id = $1
+RETURNING issue_counter;
+
+-- name: SetProjectCodeIfEmpty :one
+-- Claims a lazily derived code for a legacy project. Returns no rows when
+-- another transaction already assigned a code; the caller must then re-read
+-- the project row and use the winner's code.
+UPDATE project SET code = $2
+WHERE id = $1 AND code = ''
 RETURNING *;
 
 -- name: DeleteProject :exec

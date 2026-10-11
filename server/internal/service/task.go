@@ -7656,7 +7656,7 @@ func resolveDuplicateOf(ctx context.Context, q IssueMapQuerier, issue db.Issue, 
 	}
 	return map[string]any{
 		"id":         util.UUIDToString(row.ID),
-		"identifier": IssueIdentifier(issuePrefix, row.Number),
+		"identifier": IssueIdentifier(issuePrefix, row.NumberCode, row.Number),
 		"title":      row.Title,
 		"status":     row.Status,
 	}
@@ -7667,7 +7667,7 @@ func IssueToMap(issue db.Issue, issuePrefix string) map[string]any {
 		"id":           util.UUIDToString(issue.ID),
 		"workspace_id": util.UUIDToString(issue.WorkspaceID),
 		"number":       issue.Number,
-		"identifier":   IssueIdentifier(issuePrefix, issue.Number),
+		"identifier":   IssueIdentifier(issuePrefix, issue.NumberCode, issue.Number),
 		"title":        issue.Title,
 		"description":  util.TextToPtr(issue.Description),
 		"status":       issue.Status,
@@ -7703,14 +7703,19 @@ func IssueToMap(issue db.Issue, issuePrefix string) map[string]any {
 	}
 }
 
-// IssueIdentifier renders the human-facing issue key ("MUL-42"). Callers that
-// resolve the workspace prefix defensively may pass "": a failed workspace
-// lookup should not surface as a stray "-42", so the number stands alone as
-// "#42". The HTTP layer never passes "" — handler.getIssuePrefix derives a
-// prefix from the workspace name before rendering anything.
-func IssueIdentifier(issuePrefix string, number int32) string {
+// IssueIdentifier renders the human-facing issue key: "MUL-42" for a
+// workspace-numbered issue, "MUL-APP-42" for a project-numbered one whose
+// creation-time code snapshot was "APP". Callers that resolve the workspace
+// prefix defensively may pass "": a failed workspace lookup should not surface
+// as a stray "-42", so the number stands alone as "#42". The HTTP layer never
+// passes "" — handler.getIssuePrefix derives a prefix from the workspace name
+// before rendering anything.
+func IssueIdentifier(issuePrefix string, numberCode string, number int32) string {
 	if issuePrefix == "" {
 		return "#" + strconv.Itoa(int(number))
+	}
+	if numberCode != "" {
+		return issuePrefix + "-" + numberCode + "-" + strconv.Itoa(int(number))
 	}
 	return issuePrefix + "-" + strconv.Itoa(int(number))
 }
@@ -7881,7 +7886,7 @@ func (s *TaskService) notifyQuickCreateCompleted(ctx context.Context, task db.Ag
 	// agent-created sub-issues). Keeping a second write here would leave the
 	// same decision encoded in two places that can drift.
 	prefix := s.getIssuePrefix(workspaceID)
-	identifier := fmt.Sprintf("%s-%d", prefix, issue.Number)
+	identifier := IssueIdentifier(prefix, issue.NumberCode, issue.Number)
 	details, _ := json.Marshal(map[string]any{
 		"task_id":         util.UUIDToString(task.ID),
 		"agent_id":        util.UUIDToString(task.AgentID),

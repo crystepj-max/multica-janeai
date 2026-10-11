@@ -79,30 +79,56 @@ func CheckIssueCreateCapacity(ctx context.Context, q *db.Queries, provider entit
 	return nil
 }
 
-// AllocateIssueNumber serializes creates on the workspace row, then checks the
-// current number of issue rows inside the same transaction. The caller must
-// roll the transaction back on IssueLimitReachedError; that also rolls back
-// the counter increment. Deleting an issue frees capacity because
+// AllocateIssueNumber serializes creates on the workspace row — implicitly via
+// IncrementIssueCounter for the workspace sequence, explicitly via
+// LockWorkspaceForIssueCreate for project-numbered creates, so
+// issueposition.NextTopPosition keeps its create-vs-create guarantee in both
+// branches — then checks the current number of issue rows inside the same
+// transaction. A non-nil project with a code numbers the issue from that
+// project's own counter and returns its code as the identifier's middle
+// segment; the returned code is empty for the workspace sequence. The caller
+// must roll the transaction back on IssueLimitReachedError; that also rolls
+// back the counter increment. Deleting an issue frees capacity because
 // issue_counter is deliberately not used as quota usage.
-func AllocateIssueNumber(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID, policy IssueCountPolicy) (int32, error) {
+func AllocateIssueNumber(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID, project *db.Project, policy IssueCountPolicy) (int32, string, error) {
+	if project != nil && project.Code != "" {
+		if _, err := q.LockWorkspaceForIssueCreate(ctx, workspaceID); err != nil {
+			return 0, "", err
+		}
+		number, err := q.IncrementProjectIssueCounter(ctx, project.ID)
+		if err != nil {
+			return 0, "", err
+		}
+		if err := checkIssueQuota(ctx, q, workspaceID, policy); err != nil {
+			return 0, "", err
+		}
+		return number, project.Code, nil
+	}
 	number, err := q.IncrementIssueCounter(ctx, workspaceID)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
+	if err := checkIssueQuota(ctx, q, workspaceID, policy); err != nil {
+		return 0, "", err
+	}
+	return number, "", nil
+}
+
+func checkIssueQuota(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID, policy IssueCountPolicy) error {
 	if policy.Action != entitlement.ActionEnforce {
-		return number, nil
+		return nil
 	}
 	used, err := q.CountIssuesUpTo(ctx, db.CountIssuesUpToParams{
 		WorkspaceID: workspaceID,
 		Limit:       policy.Limit,
 	})
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if used >= policy.Limit {
-		return 0, &IssueLimitReachedError{Limit: policy.Limit, PolicyRevision: policy.PolicyRevision}
+		return &IssueLimitReachedError{Limit: policy.Limit, PolicyRevision: policy.PolicyRevision}
 	}
-	return number, nil
+	return nil
 }
 
 // CountIssueUsage performs a bounded read for a limited policy. The returned

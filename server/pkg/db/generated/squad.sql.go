@@ -376,6 +376,7 @@ SELECT
     atq.issue_id       AS task_issue_id,
     atq.dispatched_at  AS task_dispatched_at,
     i.number           AS issue_number,
+    i.number_code      AS issue_number_code,
     i.title            AS issue_title,
     i.status           AS issue_status
 FROM squad_member sm
@@ -405,6 +406,7 @@ type ListSquadMemberStatusRowsRow struct {
 	TaskIssueID       pgtype.UUID        `json:"task_issue_id"`
 	TaskDispatchedAt  pgtype.Timestamptz `json:"task_dispatched_at"`
 	IssueNumber       pgtype.Int4        `json:"issue_number"`
+	IssueNumberCode   pgtype.Text        `json:"issue_number_code"`
 	IssueTitle        pgtype.Text        `json:"issue_title"`
 	IssueStatus       pgtype.Text        `json:"issue_status"`
 }
@@ -437,6 +439,7 @@ func (q *Queries) ListSquadMemberStatusRows(ctx context.Context, squadID pgtype.
 			&i.TaskIssueID,
 			&i.TaskDispatchedAt,
 			&i.IssueNumber,
+			&i.IssueNumberCode,
 			&i.IssueTitle,
 			&i.IssueStatus,
 		); err != nil {

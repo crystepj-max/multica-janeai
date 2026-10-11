@@ -20,6 +20,9 @@ export interface Project {
   updated_at: string;
   issue_count: number;
   done_count: number;
+  // Middle segment of the project-numbered identifier ("PREFIX-CODE-N").
+  // Empty for legacy projects until their first issue derives one.
+  code: string;
   resource_count: number;
 }
 
@@ -33,6 +36,8 @@ export interface CreateProjectRequest {
   lead_id?: string;
   start_date?: string;
   due_date?: string;
+  // Optional hand-picked identifier code; derived from the title when absent.
+  code?: string;
   // Resources to attach in the same transaction as the project. Server returns
   // 4xx (and rolls back) if any one is invalid or duplicate.
   resources?: CreateProjectResourceRequest[];
@@ -49,6 +54,9 @@ export interface UpdateProjectRequest {
   // Omit the key to leave the date untouched; send null (or "") to clear it.
   start_date?: string | null;
   due_date?: string | null;
+  // Renaming affects only issues created afterwards; issued identifiers are
+  // snapshotted at creation. The key cannot be cleared.
+  code?: string;
 }
 
 export interface ListProjectsResponse {

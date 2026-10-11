@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -974,7 +975,7 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "failed to list pull requests")
 		return
 	}
-	identifier := fmt.Sprintf("%s-%d", issuePrefixForWorkspace(ws), issue.Number)
+	identifier := service.IssueIdentifier(issuePrefixForWorkspace(ws), issue.NumberCode, issue.Number)
 	rows, err := h.Queries.ListPullRequestsByIssue(r.Context(), issue.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list pull requests")
@@ -1052,12 +1053,12 @@ func (h *Handler) broadcastPRSnapshotApplied(ctx context.Context, prID pgtype.UU
 
 // ── Webhook ─────────────────────────────────────────────────────────────────
 
-// identifierRe extracts identifiers like "MUL-1510" from text. Case-insensitive
-// because branch names are conventionally lowercase but issue prefixes are
-// uppercase. Word boundary on the left prevents matching inside email-style
-// strings (e.g. "abc@MUL-1") and the digit anchor on the right rules out
-// version numbers like "v1.2-3".
-var identifierRe = regexp.MustCompile(`(?i)\b([a-z][a-z0-9]{0,9})-(\d+)\b`)
+// identifierRe extracts identifiers like "MUL-1510" or "MUL-APP-7" from text.
+// Case-insensitive because branch names are conventionally lowercase but issue
+// prefixes are uppercase. Word boundary on the left prevents matching inside
+// email-style strings (e.g. "abc@MUL-1") and the digit anchor on the right
+// rules out version numbers like "v1.2-3".
+var identifierRe = regexp.MustCompile(`(?i)\b([a-z][a-z0-9]{0,9})(?:-([a-z0-9]{1,10}))?-(\d+)\b`)
 
 // closingIdentifierRe extracts identifiers that appear immediately after a
 // GitHub-style closing keyword ("close[sd]?", "fix(e[sd])?", "resolve[sd]?"),
@@ -1067,7 +1068,7 @@ var identifierRe = regexp.MustCompile(`(?i)\b([a-z][a-z0-9]{0,9})-(\d+)\b`)
 // title prefix like "MUL-1: ..." or a branch reference links the PR but never
 // completes the issue on its own.
 var closingIdentifierRe = regexp.MustCompile(
-	`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[:\s]+([a-z][a-z0-9]{0,9})-(\d+)\b`,
+	`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[:\s]+([a-z][a-z0-9]{0,9})(?:-([a-z0-9]{1,10}))?-(\d+)\b`,
 )
 
 // HandleGitHubWebhook (POST /api/webhooks/github) is GitHub's destination for
@@ -1420,19 +1421,33 @@ func (h *Handler) resolvePRLinkPolicy(ctx context.Context, insts []db.GithubInst
 		}
 		prefix := issuePrefixForWorkspace(ws)
 		for _, id := range idents {
-			number, ok := issueNumberForPrefix(id, prefix)
+			code, number, ok := issueNumberForPrefix(id, prefix)
 			if !ok {
 				continue
 			}
-			if _, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
-				WorkspaceID: inst.WorkspaceID,
-				Number:      number,
-			}); err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					continue
+			if code != "" {
+				if _, err := h.Queries.GetIssueByNumberCode(ctx, db.GetIssueByNumberCodeParams{
+					WorkspaceID: inst.WorkspaceID,
+					NumberCode:  code,
+					Number:      number,
+				}); err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						continue
+					}
+					return indeterminate("github: cannot resolve identifier in bound workspace, leaving links unchanged for this delivery",
+						"err", err, "identifier", id, "workspace_id", uuidToString(inst.WorkspaceID))
 				}
-				return indeterminate("github: cannot resolve identifier in bound workspace, leaving links unchanged for this delivery",
-					"err", err, "identifier", id, "workspace_id", uuidToString(inst.WorkspaceID))
+			} else {
+				if _, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
+					WorkspaceID: inst.WorkspaceID,
+					Number:      number,
+				}); err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						continue
+					}
+					return indeterminate("github: cannot resolve identifier in bound workspace, leaving links unchanged for this delivery",
+						"err", err, "identifier", id, "workspace_id", uuidToString(inst.WorkspaceID))
+				}
 			}
 			resolvers[id] = append(resolvers[id], resolver{workspaceID: uuidToString(inst.WorkspaceID), autoLink: autoLink})
 		}
@@ -1886,7 +1901,16 @@ func extractMatchedIdentifiers(re *regexp.Regexp, parts ...string) []string {
 	out := []string{}
 	for _, src := range parts {
 		for _, m := range re.FindAllStringSubmatch(src, -1) {
-			ident := strings.ToUpper(m[1]) + "-" + m[2]
+			// Rebuild from capture groups — closingIdentifierRe's match
+			// includes the leading keyword, and the middle project-code group
+			// is optional, so the segments are joined from whatever matched.
+			segments := make([]string, 0, 3)
+			for _, seg := range m[1:] {
+				if seg != "" {
+					segments = append(segments, strings.ToUpper(seg))
+				}
+			}
+			ident := strings.Join(segments, "-")
 			if _, dup := seen[ident]; dup {
 				continue
 			}
@@ -1956,33 +1980,54 @@ func githubFeaturesEnabled(ws db.Workspace) bool {
 	return s.GitHubEnabled == nil || *s.GitHubEnabled
 }
 
-// issueNumberForPrefix returns the issue number encoded in a "PREFIX-NUMBER"
-// identifier, and false when the identifier is malformed or carries a prefix
-// that is not the workspace's. Case-insensitive: branch names are
-// conventionally lowercase while issue prefixes are uppercase.
-func issueNumberForPrefix(identifier, prefix string) (int32, bool) {
+// issueNumberForPrefix returns the issue number — and, for a three-part
+// identifier, the project-code segment — encoded in "PREFIX-NUMBER" or
+// "PREFIX-CODE-NUMBER". ok is false when the identifier is malformed or
+// carries a prefix that is not the workspace's. Case-insensitive: branch
+// names are conventionally lowercase while issue prefixes are uppercase. The
+// returned code is empty for the two-part form.
+func issueNumberForPrefix(identifier, prefix string) (string, int32, bool) {
 	idx := strings.LastIndex(identifier, "-")
 	if idx < 0 {
-		return 0, false
+		return "", 0, false
 	}
-	gotPrefix, numStr := identifier[:idx], identifier[idx+1:]
-	if !strings.EqualFold(gotPrefix, prefix) {
-		return 0, false
+	gotNumber, numStr := identifier[:idx], identifier[idx+1:]
+	code := ""
+	if cIdx := strings.LastIndex(gotNumber, "-"); cIdx >= 0 {
+		code = strings.ToUpper(gotNumber[cIdx+1:])
+		gotNumber = gotNumber[:cIdx]
+	}
+	if !strings.EqualFold(gotNumber, prefix) {
+		return "", 0, false
 	}
 	n, err := strconv.Atoi(numStr)
 	if err != nil {
-		return 0, false
+		return "", 0, false
 	}
-	return int32(n), true
+	return code, int32(n), true
 }
 
 // lookupIssueByIdentifier looks up an issue in the given workspace by its
-// "PREFIX-NUMBER" identifier. Returns the row + true if the prefix matches
-// the workspace's configured prefix and the number resolves to a real issue.
+// "PREFIX-NUMBER" or "PREFIX-CODE-NUMBER" identifier. Returns the row + true
+// if the prefix matches the workspace's configured prefix and the number
+// resolves to a real issue. The three-part form matches the issue's
+// creation-time code snapshot; the two-part form only matches
+// workspace-numbered issues.
 func (h *Handler) lookupIssueByIdentifier(ctx context.Context, workspaceID pgtype.UUID, prefix, identifier string) (db.Issue, bool) {
-	number, ok := issueNumberForPrefix(identifier, prefix)
+	code, number, ok := issueNumberForPrefix(identifier, prefix)
 	if !ok {
 		return db.Issue{}, false
+	}
+	if code != "" {
+		issue, err := h.Queries.GetIssueByNumberCode(ctx, db.GetIssueByNumberCodeParams{
+			WorkspaceID: workspaceID,
+			NumberCode:  code,
+			Number:      number,
+		})
+		if err != nil {
+			return db.Issue{}, false
+		}
+		return issue, true
 	}
 	issue, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
 		WorkspaceID: workspaceID,

@@ -5335,6 +5335,7 @@ SELECT
     atq.started_at,
     w.issue_prefix,
     i.number AS issue_number,
+    i.number_code AS issue_number_code,
     i.title AS issue_title
 FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
@@ -5360,15 +5361,16 @@ type ListActiveTasksByIssueFamilyParams struct {
 }
 
 type ListActiveTasksByIssueFamilyRow struct {
-	TaskID      pgtype.UUID        `json:"task_id"`
-	AgentID     pgtype.UUID        `json:"agent_id"`
-	IssueID     pgtype.UUID        `json:"issue_id"`
-	Status      string             `json:"status"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	StartedAt   pgtype.Timestamptz `json:"started_at"`
-	IssuePrefix string             `json:"issue_prefix"`
-	IssueNumber int32              `json:"issue_number"`
-	IssueTitle  string             `json:"issue_title"`
+	TaskID          pgtype.UUID        `json:"task_id"`
+	AgentID         pgtype.UUID        `json:"agent_id"`
+	IssueID         pgtype.UUID        `json:"issue_id"`
+	Status          string             `json:"status"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	StartedAt       pgtype.Timestamptz `json:"started_at"`
+	IssuePrefix     string             `json:"issue_prefix"`
+	IssueNumber     int32              `json:"issue_number"`
+	IssueNumberCode string             `json:"issue_number_code"`
+	IssueTitle      string             `json:"issue_title"`
 }
 
 // Cross-issue coordination read for parallel sub-issue work (#7768). Given a
@@ -5415,6 +5417,7 @@ func (q *Queries) ListActiveTasksByIssueFamily(ctx context.Context, arg ListActi
 			&i.StartedAt,
 			&i.IssuePrefix,
 			&i.IssueNumber,
+			&i.IssueNumberCode,
 			&i.IssueTitle,
 		); err != nil {
 			return nil, err

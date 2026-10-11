@@ -22,6 +22,12 @@ describe("preprocessIssueIdentifiers", () => {
     );
   });
 
+  it("rewrites a project-numbered three-part identifier", () => {
+    expect(preprocessIssueIdentifiers("Blocked by MUL-APP-7")).toBe(
+      "Blocked by [MUL-APP-7](mention://issue/MUL-APP-7)",
+    );
+  });
+
   it("links an identifier at a sentence end (trailing dot + space)", () => {
     expect(preprocessIssueIdentifiers("See MUL-1. Done.")).toBe(
       "See [MUL-1](mention://issue/MUL-1). Done.",
@@ -94,6 +100,12 @@ describe("isIssueIdentifier", () => {
   it("accepts a bare identifier", () => {
     expect(isIssueIdentifier("MUL-1745")).toBe(true);
     expect(isIssueIdentifier("TES-1")).toBe(true);
+  });
+
+  it("accepts a project-numbered three-part identifier", () => {
+    expect(isIssueIdentifier("MUL-APP-7")).toBe(true);
+    expect(isIssueIdentifier("MUL-A1B2-7")).toBe(true);
+    expect(isIssueIdentifier("MUL-A-B-7")).toBe(false);
   });
 
   it("rejects a UUID (so real mentions are not treated as identifiers)", () => {

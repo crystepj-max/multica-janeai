@@ -13,7 +13,7 @@ import (
 
 const listWorkspaceWakeups = `-- name: ListWorkspaceWakeups :one
 WITH base AS MATERIALIZED (
- SELECT w.id,w.issue_id,i.title AS issue_title,ws.issue_prefix||'-'||i.number AS issue_identifier,
+ SELECT w.id,w.issue_id,i.title AS issue_title,ws.issue_prefix||'-'||(CASE WHEN i.number_code<>'' THEN i.number_code||'-' ELSE '' END)||i.number AS issue_identifier,
   w.agent_id,a.name AS agent_name,w.kind,w.mode,w.event_types,w.filter_actor_type,
  (CASE WHEN actor_agent.id IS NOT NULL OR actor_member.user_id IS NOT NULL THEN w.filter_actor_id END)::uuid AS filter_actor_id,
  COALESCE(actor_agent.name,actor_user.name,'')::text AS filter_actor_name,

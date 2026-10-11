@@ -314,13 +314,24 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			projectID = parent.ProjectID
 		}
 	}
+	var project *db.Project
 	if projectID.Valid {
-		if _, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
+		row, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
 			ID:          projectID,
 			WorkspaceID: p.WorkspaceID,
-		}); err != nil {
+		})
+		if err != nil {
 			return IssueCreateResult{}, ErrProjectNotFound
 		}
+		// Legacy projects carry code = '' until their first issue lazily
+		// derives and claims one; the claim rolls back with this create if
+		// it fails.
+		code, err := EnsureProjectCode(ctx, qtx, row)
+		if err != nil {
+			return IssueCreateResult{}, fmt.Errorf("project code: %w", err)
+		}
+		row.Code = code
+		project = &row
 	}
 
 	// Validate labels before we increment the issue counter so a stale or
@@ -341,7 +352,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		return IssueCreateResult{DuplicateIssue: &dup}, ErrActiveDuplicate
 	}
 
-	issueNumber, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, issueCountPolicy)
+	issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, project, issueCountPolicy)
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("allocate issue number: %w", err)
 	}
@@ -380,6 +391,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			DueDate:       p.DueDate,
 			Number:        issueNumber,
 			ProjectID:     projectID,
+			NumberCode:    numberCode,
 			OriginType:    p.OriginType,
 			OriginID:      p.OriginID,
 			Stage:         p.Stage,
@@ -403,6 +415,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			DueDate:       p.DueDate,
 			Number:        issueNumber,
 			ProjectID:     projectID,
+			NumberCode:    numberCode,
 			Stage:         p.Stage,
 			Properties:    properties,
 		})

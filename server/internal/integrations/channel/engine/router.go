@@ -591,7 +591,7 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 			res.IssueID = duplicate.ID
 			res.IssueNumber = duplicate.Number
 			res.IssueTitle = duplicate.Title
-			res.IssueIdentifier = service.IssueIdentifier(prefix, duplicate.Number)
+			res.IssueIdentifier = service.IssueIdentifier(prefix, duplicate.NumberCode, duplicate.Number)
 			res.IssueWorkspaceSlug = workspaceSlug
 			res.IssueDuplicate = true
 			// A duplicate is a terminal product outcome, not an infrastructure
@@ -614,7 +614,7 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		res.IssueTitle = issueRes.Issue.Title
 		// Same renderer the broadcast payload uses, so a degraded prefix can't
 		// show the chat "#42" while the realtime list shows "-42".
-		res.IssueIdentifier = service.IssueIdentifier(prefix, issueRes.Issue.Number)
+		res.IssueIdentifier = service.IssueIdentifier(prefix, issueRes.Issue.NumberCode, issueRes.Issue.Number)
 		res.IssueWorkspaceSlug = workspaceSlug
 		// IssueService.Create already enqueues the assigned agent's issue task.
 		// Scheduling the command as a chat run too makes the agent execute the

@@ -248,7 +248,7 @@ func (h *Handler) BootstrapOnboardingRuntime(w http.ResponseWriter, r *http.Requ
 	}
 	issueCreated := false
 	if !foundIssue {
-		issueNumber, err := service.AllocateIssueNumber(r.Context(), qtx, wsUUID, issueCountPolicy)
+		issueNumber, _, err := service.AllocateIssueNumber(r.Context(), qtx, wsUUID, nil, issueCountPolicy)
 		if err != nil {
 			if writeIssueLimitReached(w, err) {
 				return
@@ -275,6 +275,7 @@ func (h *Handler) BootstrapOnboardingRuntime(w http.ResponseWriter, r *http.Requ
 			Position:      0,
 			Number:        issueNumber,
 			ProjectID:     emptyUUID,
+			NumberCode:    "",
 		})
 		if err != nil {
 			slog.Warn("bootstrap onboarding (shim): create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", req.WorkspaceID)...)
@@ -416,7 +417,7 @@ func (h *Handler) BootstrapOnboardingNoRuntime(w http.ResponseWriter, r *http.Re
 	if foundIssue {
 		issue = existing
 	} else {
-		issueNumber, err := service.AllocateIssueNumber(r.Context(), qtx, wsUUID, issueCountPolicy)
+		issueNumber, _, err := service.AllocateIssueNumber(r.Context(), qtx, wsUUID, nil, issueCountPolicy)
 		if err != nil {
 			if writeIssueLimitReached(w, err) {
 				return
@@ -439,6 +440,7 @@ func (h *Handler) BootstrapOnboardingNoRuntime(w http.ResponseWriter, r *http.Re
 			Position:      0,
 			Number:        issueNumber,
 			ProjectID:     emptyUUID,
+			NumberCode:    "",
 		})
 		if err != nil {
 			slog.Warn("bootstrap no-runtime onboarding (shim): create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", req.WorkspaceID)...)

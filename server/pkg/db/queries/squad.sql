@@ -153,6 +153,7 @@ SELECT
     atq.issue_id       AS task_issue_id,
     atq.dispatched_at  AS task_dispatched_at,
     i.number           AS issue_number,
+    i.number_code      AS issue_number_code,
     i.title            AS issue_title,
     i.status           AS issue_status
 FROM squad_member sm

@@ -24,9 +24,10 @@ import { issueBehavesAs } from "../issues/status-category";
 
 /**
  * Mirrors the server's identifier pattern (parseQueryNumber in
- * server/internal/handler/issue.go): "MUL-123" or a bare "123".
+ * server/internal/handler/issue.go): "MUL-123", the project-numbered
+ * three-part form "MUL-APP-7", or a bare "123".
  */
-const IDENTIFIER_NUMBER_RE = /^[a-z]+-(\d+)$/i;
+const IDENTIFIER_NUMBER_RE = /^[a-z]+(?:-[a-z0-9]{1,10})?-(\d+)$/i;
 
 /** Extracts the issue number a query targets, or null when it targets none. */
 export function parseSearchQueryNumber(query: string): number | null {

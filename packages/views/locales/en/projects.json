@@ -70,6 +70,8 @@
     "section_description": "Description",
     "prop_start_date": "Start date",
     "prop_due_date": "Due date",
+    "prop_code": "Code",
+    "code_tooltip": "Identifier code used in issue IDs (PREFIX-CODE-N). Renaming only affects issues created afterwards.",
     "no_start_date": "No start date",
     "no_due_date": "No due date",
     "description_placeholder": "Add description...",

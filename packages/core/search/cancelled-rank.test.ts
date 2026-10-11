@@ -39,6 +39,11 @@ describe("parseSearchQueryNumber", () => {
     expect(parseSearchQueryNumber("  123 ")).toBe(123);
   });
 
+  it("reads the number from a project-numbered three-part identifier", () => {
+    expect(parseSearchQueryNumber("MUL-APP-7")).toBe(7);
+    expect(parseSearchQueryNumber("mul-app-7")).toBe(7);
+  });
+
   it("returns null for anything that is not a target", () => {
     expect(parseSearchQueryNumber("search")).toBeNull();
     expect(parseSearchQueryNumber("MUL-")).toBeNull();
@@ -54,6 +59,12 @@ describe("direct hits", () => {
     expect(isIssueDirectHit(it1, "42")).toBe(true);
     expect(isIssueDirectHit(it1, "  ship IT ")).toBe(true);
     expect(isIssueDirectHit(it1, "ship")).toBe(false);
+  });
+
+  it("treats a project-numbered identifier as targeting its issue", () => {
+    const it1 = issue({ id: "i1", number: 7, identifier: "MUL-APP-7", title: "Ship it" });
+    expect(isIssueDirectHit(it1, "MUL-APP-7")).toBe(true);
+    expect(isIssueDirectHit(it1, "MUL-7")).toBe(false);
   });
 
   it("treats only an exact title as targeting the project", () => {

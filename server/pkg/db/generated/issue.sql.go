@@ -61,7 +61,7 @@ SET duplicate_of_issue_id = NULL,
 WHERE workspace_id = $1
   AND duplicate_of_issue_id = $2::uuid
   AND NOT COALESCE(id = ANY($3::uuid[]), false)
-RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
+RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code
 `
 
 type ClearIssueDuplicatesOfParams struct {
@@ -113,6 +113,7 @@ func (q *Queries) ClearIssueDuplicatesOf(ctx context.Context, arg ClearIssueDupl
 			&i.LastActivityAt,
 			&i.TriageState,
 			&i.DuplicateOfIssueID,
+			&i.NumberCode,
 		); err != nil {
 			return nil, err
 		}
@@ -298,11 +299,13 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
+    number_code,
     stage, properties, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    $16, COALESCE($17::jsonb, '{}'::jsonb), now(), COALESCE($18::uuid, gen_random_uuid())
-) RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
+    $16,
+    $17, COALESCE($18::jsonb, '{}'::jsonb), now(), COALESCE($19::uuid, gen_random_uuid())
+) RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code
 `
 
 type CreateIssueParams struct {
@@ -321,6 +324,7 @@ type CreateIssueParams struct {
 	DueDate       pgtype.Date `json:"due_date"`
 	Number        int32       `json:"number"`
 	ProjectID     pgtype.UUID `json:"project_id"`
+	NumberCode    string      `json:"number_code"`
 	Stage         pgtype.Int4 `json:"stage"`
 	Properties    []byte      `json:"properties"`
 	ID            pgtype.UUID `json:"id"`
@@ -343,6 +347,7 @@ func (q *Queries) CreateIssue(ctx context.Context, arg CreateIssueParams) (Issue
 		arg.DueDate,
 		arg.Number,
 		arg.ProjectID,
+		arg.NumberCode,
 		arg.Stage,
 		arg.Properties,
 		arg.ID,
@@ -379,6 +384,7 @@ func (q *Queries) CreateIssue(ctx context.Context, arg CreateIssueParams) (Issue
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
@@ -388,11 +394,13 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
+    number_code,
     origin_type, origin_id, stage, properties, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    $16, $17, $18, COALESCE($19::jsonb, '{}'::jsonb), now(), COALESCE($20::uuid, gen_random_uuid())
-) RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
+    $16,
+    $17, $18, $19, COALESCE($20::jsonb, '{}'::jsonb), now(), COALESCE($21::uuid, gen_random_uuid())
+) RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code
 `
 
 type CreateIssueWithOriginParams struct {
@@ -411,6 +419,7 @@ type CreateIssueWithOriginParams struct {
 	DueDate       pgtype.Date `json:"due_date"`
 	Number        int32       `json:"number"`
 	ProjectID     pgtype.UUID `json:"project_id"`
+	NumberCode    string      `json:"number_code"`
 	OriginType    pgtype.Text `json:"origin_type"`
 	OriginID      pgtype.UUID `json:"origin_id"`
 	Stage         pgtype.Int4 `json:"stage"`
@@ -435,6 +444,7 @@ func (q *Queries) CreateIssueWithOrigin(ctx context.Context, arg CreateIssueWith
 		arg.DueDate,
 		arg.Number,
 		arg.ProjectID,
+		arg.NumberCode,
 		arg.OriginType,
 		arg.OriginID,
 		arg.Stage,
@@ -473,6 +483,7 @@ func (q *Queries) CreateIssueWithOrigin(ctx context.Context, arg CreateIssueWith
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
@@ -579,7 +590,7 @@ SET parent_issue_id = NULL,
 WHERE workspace_id = $1
   AND parent_issue_id = $2
   AND NOT COALESCE(id = ANY($3::uuid[]), false)
-RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
+RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code
 `
 
 type DetachDirectChildIssuesParams struct {
@@ -628,6 +639,7 @@ func (q *Queries) DetachDirectChildIssues(ctx context.Context, arg DetachDirectC
 			&i.LastActivityAt,
 			&i.TriageState,
 			&i.DuplicateOfIssueID,
+			&i.NumberCode,
 		); err != nil {
 			return nil, err
 		}
@@ -640,7 +652,7 @@ func (q *Queries) DetachDirectChildIssues(ctx context.Context, arg DetachDirectC
 }
 
 const findActiveDuplicateIssue = `-- name: FindActiveDuplicateIssue :one
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE workspace_id = $1
   -- Negate only known terminal keys so an unknown legacy key remains active.
   AND NOT (status = ANY($2::text[]))
@@ -703,12 +715,13 @@ func (q *Queries) FindActiveDuplicateIssue(ctx context.Context, arg FindActiveDu
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
 
 const findRecentAutopilotDuplicateIssue = `-- name: FindRecentAutopilotDuplicateIssue :one
-SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id FROM issue i
+SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id, i.number_code FROM issue i
 WHERE i.workspace_id = $1
   -- Negate only known terminal keys so an unknown legacy key remains active.
   AND NOT (i.status = ANY($3::text[]))
@@ -782,12 +795,13 @@ func (q *Queries) FindRecentAutopilotDuplicateIssue(ctx context.Context, arg Fin
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
 
 const getIssue = `-- name: GetIssue :one
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE id = $1
 `
 
@@ -825,13 +839,14 @@ func (q *Queries) GetIssue(ctx context.Context, id pgtype.UUID) (Issue, error) {
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
 
 const getIssueByNumber = `-- name: GetIssueByNumber :one
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
-WHERE workspace_id = $1 AND number = $2
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
+WHERE workspace_id = $1 AND number = $2 AND number_code = ''
 `
 
 type GetIssueByNumberParams struct {
@@ -839,6 +854,8 @@ type GetIssueByNumberParams struct {
 	Number      int32       `json:"number"`
 }
 
+// Workspace-numbered issues only: a bare "PREFIX-N" identifier must never
+// resolve to a project-numbered issue that happens to reuse the number.
 func (q *Queries) GetIssueByNumber(ctx context.Context, arg GetIssueByNumberParams) (Issue, error) {
 	row := q.db.QueryRow(ctx, getIssueByNumber, arg.WorkspaceID, arg.Number)
 	var i Issue
@@ -873,12 +890,66 @@ func (q *Queries) GetIssueByNumber(ctx context.Context, arg GetIssueByNumberPara
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
+	)
+	return i, err
+}
+
+const getIssueByNumberCode = `-- name: GetIssueByNumberCode :one
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
+WHERE workspace_id = $1 AND number_code = $2 AND number = $3
+`
+
+type GetIssueByNumberCodeParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	NumberCode  string      `json:"number_code"`
+	Number      int32       `json:"number"`
+}
+
+// Project-numbered lookup for three-segment identifiers ("PREFIX-CODE-N").
+// Matches the creation-time number_code snapshot, so identifiers keep
+// resolving after project renames or project deletion.
+func (q *Queries) GetIssueByNumberCode(ctx context.Context, arg GetIssueByNumberCodeParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, getIssueByNumberCode, arg.WorkspaceID, arg.NumberCode, arg.Number)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Title,
+		&i.Description,
+		&i.Status,
+		&i.Priority,
+		&i.AssigneeType,
+		&i.AssigneeID,
+		&i.CreatorType,
+		&i.CreatorID,
+		&i.ParentIssueID,
+		&i.AcceptanceCriteria,
+		&i.ContextRefs,
+		&i.Position,
+		&i.DueDate,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Number,
+		&i.ProjectID,
+		&i.OriginType,
+		&i.OriginID,
+		&i.FirstExecutedAt,
+		&i.StartDate,
+		&i.Metadata,
+		&i.Stage,
+		&i.Properties,
+		&i.Revision,
+		&i.LastActivityAt,
+		&i.TriageState,
+		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
 
 const getIssueByOrigin = `-- name: GetIssueByOrigin :one
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE workspace_id = $1
   AND origin_type = $2
   AND origin_id = $3
@@ -930,6 +1001,7 @@ func (q *Queries) GetIssueByOrigin(ctx context.Context, arg GetIssueByOriginPara
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
@@ -954,7 +1026,7 @@ func (q *Queries) GetIssueGCStatus(ctx context.Context, id pgtype.UUID) (GetIssu
 }
 
 const getIssueInWorkspace = `-- name: GetIssueInWorkspace :one
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE id = $1 AND workspace_id = $2
 `
 
@@ -997,6 +1069,7 @@ func (q *Queries) GetIssueInWorkspace(ctx context.Context, arg GetIssueInWorkspa
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
@@ -1026,7 +1099,7 @@ func (q *Queries) GetIssueMetadataInWorkspace(ctx context.Context, arg GetIssueM
 }
 
 const getIssueRefInWorkspace = `-- name: GetIssueRefInWorkspace :one
-SELECT id, number, title, status FROM issue
+SELECT id, number, number_code, title, status FROM issue
 WHERE id = $1 AND workspace_id = $2
 `
 
@@ -1036,10 +1109,11 @@ type GetIssueRefInWorkspaceParams struct {
 }
 
 type GetIssueRefInWorkspaceRow struct {
-	ID     pgtype.UUID `json:"id"`
-	Number int32       `json:"number"`
-	Title  string      `json:"title"`
-	Status string      `json:"status"`
+	ID         pgtype.UUID `json:"id"`
+	Number     int32       `json:"number"`
+	NumberCode string      `json:"number_code"`
+	Title      string      `json:"title"`
+	Status     string      `json:"status"`
 }
 
 // The summary a duplicate's response carries for its original (MUL-7349).
@@ -1049,6 +1123,7 @@ func (q *Queries) GetIssueRefInWorkspace(ctx context.Context, arg GetIssueRefInW
 	err := row.Scan(
 		&i.ID,
 		&i.Number,
+		&i.NumberCode,
 		&i.Title,
 		&i.Status,
 	)
@@ -1096,7 +1171,7 @@ func (q *Queries) IssueHasDuplicates(ctx context.Context, arg IssueHasDuplicates
 }
 
 const listChildIssues = `-- name: ListChildIssues :many
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE parent_issue_id = $1
 ORDER BY number ASC
 `
@@ -1147,6 +1222,7 @@ func (q *Queries) ListChildIssues(ctx context.Context, parentIssueID pgtype.UUID
 			&i.LastActivityAt,
 			&i.TriageState,
 			&i.DuplicateOfIssueID,
+			&i.NumberCode,
 		); err != nil {
 			return nil, err
 		}
@@ -1159,7 +1235,7 @@ func (q *Queries) ListChildIssues(ctx context.Context, parentIssueID pgtype.UUID
 }
 
 const listChildrenByParents = `-- name: ListChildrenByParents :many
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE workspace_id = $1
   AND parent_issue_id = ANY($2::uuid[])
 ORDER BY parent_issue_id, number ASC
@@ -1217,6 +1293,7 @@ func (q *Queries) ListChildrenByParents(ctx context.Context, arg ListChildrenByP
 			&i.LastActivityAt,
 			&i.TriageState,
 			&i.DuplicateOfIssueID,
+			&i.NumberCode,
 		); err != nil {
 			return nil, err
 		}
@@ -1229,7 +1306,7 @@ func (q *Queries) ListChildrenByParents(ctx context.Context, arg ListChildrenByP
 }
 
 const listIssueDuplicates = `-- name: ListIssueDuplicates :many
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE workspace_id = $1
   AND duplicate_of_issue_id = $2::uuid
   AND status = 'cancelled'
@@ -1281,6 +1358,7 @@ func (q *Queries) ListIssueDuplicates(ctx context.Context, arg ListIssueDuplicat
 			&i.LastActivityAt,
 			&i.TriageState,
 			&i.DuplicateOfIssueID,
+			&i.NumberCode,
 		); err != nil {
 			return nil, err
 		}
@@ -1331,7 +1409,7 @@ func (q *Queries) ListIssueGCStatuses(ctx context.Context, arg ListIssueGCStatus
 }
 
 const listIssueRefsInWorkspace = `-- name: ListIssueRefsInWorkspace :many
-SELECT id, number, title, status FROM issue
+SELECT id, number, number_code, title, status FROM issue
 WHERE workspace_id = $1
   AND id = ANY($2::uuid[])
 `
@@ -1342,10 +1420,11 @@ type ListIssueRefsInWorkspaceParams struct {
 }
 
 type ListIssueRefsInWorkspaceRow struct {
-	ID     pgtype.UUID `json:"id"`
-	Number int32       `json:"number"`
-	Title  string      `json:"title"`
-	Status string      `json:"status"`
+	ID         pgtype.UUID `json:"id"`
+	Number     int32       `json:"number"`
+	NumberCode string      `json:"number_code"`
+	Title      string      `json:"title"`
+	Status     string      `json:"status"`
 }
 
 // GetIssueRefInWorkspace for a page: every original the page's duplicates
@@ -1362,6 +1441,7 @@ func (q *Queries) ListIssueRefsInWorkspace(ctx context.Context, arg ListIssueRef
 		if err := rows.Scan(
 			&i.ID,
 			&i.Number,
+			&i.NumberCode,
 			&i.Title,
 			&i.Status,
 		); err != nil {
@@ -1378,7 +1458,7 @@ func (q *Queries) ListIssueRefsInWorkspace(ctx context.Context, arg ListIssueRef
 const listIssues = `-- name: ListIssues :many
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id, i.metadata, i.stage, i.properties,
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.number_code, i.project_id, i.metadata, i.stage, i.properties,
        i.revision, i.duplicate_of_issue_id
 FROM issue i
 WHERE i.workspace_id = $1
@@ -1468,6 +1548,7 @@ type ListIssuesRow struct {
 	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
 	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
 	Number             int32              `json:"number"`
+	NumberCode         string             `json:"number_code"`
 	ProjectID          pgtype.UUID        `json:"project_id"`
 	Metadata           []byte             `json:"metadata"`
 	Stage              pgtype.Int4        `json:"stage"`
@@ -1523,6 +1604,7 @@ func (q *Queries) ListIssues(ctx context.Context, arg ListIssuesParams) ([]ListI
 			&i.UpdatedAt,
 			&i.LastActivityAt,
 			&i.Number,
+			&i.NumberCode,
 			&i.ProjectID,
 			&i.Metadata,
 			&i.Stage,
@@ -1543,7 +1625,7 @@ func (q *Queries) ListIssues(ctx context.Context, arg ListIssuesParams) ([]ListI
 const listOpenIssues = `-- name: ListOpenIssues :many
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id, i.metadata, i.stage, i.properties,
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.number_code, i.project_id, i.metadata, i.stage, i.properties,
        i.revision, i.duplicate_of_issue_id
 FROM issue i
 WHERE i.workspace_id = $1
@@ -1679,6 +1761,7 @@ type ListOpenIssuesRow struct {
 	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
 	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
 	Number             int32              `json:"number"`
+	NumberCode         string             `json:"number_code"`
 	ProjectID          pgtype.UUID        `json:"project_id"`
 	Metadata           []byte             `json:"metadata"`
 	Stage              pgtype.Int4        `json:"stage"`
@@ -1728,6 +1811,7 @@ func (q *Queries) ListOpenIssues(ctx context.Context, arg ListOpenIssuesParams) 
 			&i.UpdatedAt,
 			&i.LastActivityAt,
 			&i.Number,
+			&i.NumberCode,
 			&i.ProjectID,
 			&i.Metadata,
 			&i.Stage,
@@ -1827,7 +1911,7 @@ func (q *Queries) LockIssueForDelete(ctx context.Context, arg LockIssueForDelete
 }
 
 const lockIssueForDescriptionUpdate = `-- name: LockIssueForDescriptionUpdate :one
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE id = $1 AND workspace_id = $2
 FOR UPDATE
 `
@@ -1875,6 +1959,7 @@ func (q *Queries) LockIssueForDescriptionUpdate(ctx context.Context, arg LockIss
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
@@ -1973,7 +2058,7 @@ SET description = CASE
     updated_at = now()
 WHERE id = $4
   AND workspace_id = $5
-RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
+RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code
 `
 
 type MaterializeIssueChannelMediaMarkdownParams struct {
@@ -2031,6 +2116,7 @@ func (q *Queries) MaterializeIssueChannelMediaMarkdown(ctx context.Context, arg 
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
@@ -2094,7 +2180,7 @@ WITH wakeup_source AS MATERIALIZED (SELECT set_config('multica.source_task_id', 
     -- did_change/did_activity would be decided against the pre-wait row too.
     -- Materialized so the locking clause is never inlined away.
     SELECT
-        i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id,
+        i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id, i.number_code,
         COALESCE($4::text, i.title) AS next_title,
         COALESCE($5::text, i.description) AS next_description,
         COALESCE($6::text, i.status) AS next_status,
@@ -2152,7 +2238,7 @@ WITH wakeup_source AS MATERIALIZED (SELECT set_config('multica.source_task_id', 
     FOR UPDATE
 ), changed AS (
     SELECT
-        candidate.id, candidate.workspace_id, candidate.title, candidate.description, candidate.status, candidate.priority, candidate.assignee_type, candidate.assignee_id, candidate.creator_type, candidate.creator_id, candidate.parent_issue_id, candidate.acceptance_criteria, candidate.context_refs, candidate.position, candidate.due_date, candidate.created_at, candidate.updated_at, candidate.number, candidate.project_id, candidate.origin_type, candidate.origin_id, candidate.first_executed_at, candidate.start_date, candidate.metadata, candidate.stage, candidate.properties, candidate.revision, candidate.last_activity_at, candidate.triage_state, candidate.duplicate_of_issue_id, candidate.next_title, candidate.next_description, candidate.next_status, candidate.next_priority, candidate.next_assignee_type, candidate.next_assignee_id, candidate.next_position, candidate.next_start_date, candidate.next_due_date, candidate.next_parent_issue_id, candidate.next_project_id, candidate.next_stage, candidate.next_duplicate_of_issue_id,
+        candidate.id, candidate.workspace_id, candidate.title, candidate.description, candidate.status, candidate.priority, candidate.assignee_type, candidate.assignee_id, candidate.creator_type, candidate.creator_id, candidate.parent_issue_id, candidate.acceptance_criteria, candidate.context_refs, candidate.position, candidate.due_date, candidate.created_at, candidate.updated_at, candidate.number, candidate.project_id, candidate.origin_type, candidate.origin_id, candidate.first_executed_at, candidate.start_date, candidate.metadata, candidate.stage, candidate.properties, candidate.revision, candidate.last_activity_at, candidate.triage_state, candidate.duplicate_of_issue_id, candidate.number_code, candidate.next_title, candidate.next_description, candidate.next_status, candidate.next_priority, candidate.next_assignee_type, candidate.next_assignee_id, candidate.next_position, candidate.next_start_date, candidate.next_due_date, candidate.next_parent_issue_id, candidate.next_project_id, candidate.next_stage, candidate.next_duplicate_of_issue_id,
         ROW(
             title, description, status, priority, assignee_type, assignee_id,
             position, start_date, due_date, parent_issue_id, project_id, stage,
@@ -2202,7 +2288,7 @@ WHERE i.id = changed.id
   -- from the same snapshot; EvalPlanQual re-evaluates this target-row predicate
   -- after waiting for the first writer, leaving the stale writer with 0 rows.
   AND ($2::bigint IS NULL OR i.revision = $2::bigint)
-RETURNING i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id
+RETURNING i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id, i.number_code
 `
 
 type UpdateIssueParams struct {
@@ -2275,6 +2361,7 @@ func (q *Queries) UpdateIssue(ctx context.Context, arg UpdateIssueParams) (Issue
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }
@@ -2301,7 +2388,7 @@ UPDATE issue AS i SET
     updated_at = now()
 FROM wakeup_source
 WHERE i.id = $1 AND i.workspace_id = $3
-RETURNING i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id
+RETURNING i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id, i.number_code
 `
 
 type UpdateIssueStatusParams struct {
@@ -2355,6 +2442,7 @@ func (q *Queries) UpdateIssueStatus(ctx context.Context, arg UpdateIssueStatusPa
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }

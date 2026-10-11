@@ -198,6 +198,7 @@ const PROJECT: Project = {
   updated_at: "2026-06-01T00:00:00Z",
   issue_count: 3,
   done_count: 1,
+  code: "LAUN",
   resource_count: 0,
 };
 

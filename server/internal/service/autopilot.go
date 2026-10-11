@@ -715,7 +715,24 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		return &errDispatchSkipped{reason: "recent duplicate autopilot issue: " + util.UUIDToString(duplicate.ID), code: dispatch.ReasonAlreadyActive}
 	}
 
-	issueNumber, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, issueCountPolicy)
+	var project *db.Project
+	if projectID.Valid {
+		row, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
+			ID:          projectID,
+			WorkspaceID: ap.WorkspaceID,
+		})
+		if err != nil {
+			return fmt.Errorf("load project: %w", err)
+		}
+		code, err := EnsureProjectCode(ctx, qtx, row)
+		if err != nil {
+			return fmt.Errorf("project code: %w", err)
+		}
+		row.Code = code
+		project = &row
+	}
+
+	issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, project, issueCountPolicy)
 	if err != nil {
 		var limitErr *IssueLimitReachedError
 		if errors.As(err, &limitErr) {
@@ -754,6 +771,7 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		DueDate:       pgtype.Date{},
 		Number:        issueNumber,
 		ProjectID:     projectID,
+		NumberCode:    numberCode,
 		OriginType:    pgtype.Text{String: "autopilot", Valid: true},
 		OriginID:      ap.ID,
 	})

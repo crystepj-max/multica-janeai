@@ -69,6 +69,8 @@
     "section_description": "설명",
     "prop_start_date": "시작일",
     "prop_due_date": "마감일",
+    "prop_code": "코드",
+    "code_tooltip": "작업 번호(접두사-코드-번호)에 사용됩니다. 변경은 이후 생성되는 작업에만 영향을 줍니다.",
     "no_start_date": "시작일 없음",
     "no_due_date": "마감일 없음",
     "description_placeholder": "설명 추가...",

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -464,19 +465,24 @@ func (h *Handler) fillDuplicateOf(ctx context.Context, wsID pgtype.UUID, resp *I
 	if row == nil {
 		return
 	}
-	// The response already rendered its own identifier with the workspace
-	// prefix; the original shares it.
-	prefix := strings.TrimSuffix(resp.Identifier, "-"+strconv.Itoa(int(resp.Number)))
+	// The workspace prefix is this response's own first identifier segment;
+	// the original renders with the same prefix but its own creation-time
+	// code snapshot (the two may live in different projects). A degraded
+	// "#42" identifier has no dash, meaning no prefix either.
+	prefix, _, hasDash := strings.Cut(resp.Identifier, "-")
+	if !hasDash {
+		prefix = ""
+	}
 	resp.DuplicateOf = &IssueRefResponse{
 		ID:         uuidToString(row.ID),
-		Identifier: prefix + "-" + strconv.Itoa(int(row.Number)),
+		Identifier: service.IssueIdentifier(prefix, row.NumberCode, row.Number),
 		Title:      row.Title,
 		Status:     row.Status,
 	}
 }
 
 func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
-	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	identifier := service.IssueIdentifier(issuePrefix, i.NumberCode, i.Number)
 	// Built-ins map to public categories without a catalog lookup. A custom
 	// status is filled by endpoints that resolve the workspace catalog.
 	statusCategory := ""
@@ -520,7 +526,7 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 	if issuestatus.IsBuiltIn(i.Status) {
 		statusCategory = i.Status
 	}
-	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	identifier := service.IssueIdentifier(issuePrefix, i.NumberCode, i.Number)
 	return IssueResponse{
 		ID:                 uuidToString(i.ID),
 		WorkspaceID:        uuidToString(i.WorkspaceID),
@@ -590,7 +596,7 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 	if issuestatus.IsBuiltIn(i.Status) {
 		statusCategory = i.Status
 	}
-	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	identifier := service.IssueIdentifier(issuePrefix, i.NumberCode, i.Number)
 	return IssueResponse{
 		ID:                 uuidToString(i.ID),
 		WorkspaceID:        uuidToString(i.WorkspaceID),
@@ -774,21 +780,38 @@ func splitSearchTerms(q string) []string {
 	return terms
 }
 
-// identifierNumberRe matches patterns like "MUL-123" or "ABC-45".
-var identifierNumberRe = regexp.MustCompile(`(?i)^[a-z]+-(\d+)$`)
+// identifierNumberRe matches patterns like "MUL-123", "MUL-APP-7", or
+// "ABC-45" (the optional middle segment is a project code).
+var identifierNumberRe = regexp.MustCompile(`(?i)^[a-z]+(?:-[a-z0-9]{1,10})?-(\d+)$`)
+
+// identifierCodeRe matches three-part identifiers ("MUL-APP-7") and captures
+// the project-code middle segment.
+var identifierCodeRe = regexp.MustCompile(`(?i)^[a-z]+-([a-z0-9]{1,10})-(\d+)$`)
+
+// identifierQueryCode returns the project-code segment of a three-part
+// identifier query ("MUL-APP-7" → "APP"), or "" for two-part identifiers and
+// bare numbers.
+func identifierQueryCode(q string) string {
+	if m := identifierCodeRe.FindStringSubmatch(strings.TrimSpace(q)); m != nil {
+		return strings.ToUpper(m[1])
+	}
+	return ""
+}
 
 // parseQueryNumber extracts an issue number from the query if it looks like
-// an identifier (e.g. "MUL-123") or a bare number (e.g. "123").
+// an identifier (e.g. "MUL-123") or a bare number (e.g. "123"). Numbers above
+// int32 are rejected — the column is int4, and a timestamp-shaped title tail
+// ("report-1791726067515281000") would otherwise bind an out-of-range param.
 func parseQueryNumber(q string) (int, bool) {
 	q = strings.TrimSpace(q)
 	// Check for identifier pattern like "MUL-123"
 	if m := identifierNumberRe.FindStringSubmatch(q); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 && n <= math.MaxInt32 {
 			return n, true
 		}
 	}
 	// Check for bare number
-	if n, err := strconv.Atoi(q); err == nil && n > 0 {
+	if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= math.MaxInt32 {
 		return n, true
 	}
 	return 0, false
@@ -836,6 +859,19 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	if hasNum {
 		numParam = nextArg(queryNum)
 	}
+	// Scope the number match to the numbering sequence the query names: a
+	// three-part identifier ("MUL-APP-7") targets that project's sequence,
+	// while a two-part identifier or a bare number only ever targets the
+	// workspace-numbered sequence.
+	numberExactExpr := ""
+	if hasNum {
+		if code := identifierQueryCode(phrase); code != "" {
+			codeParam := nextArg(code)
+			numberExactExpr = fmt.Sprintf("(i.number = %s AND i.number_code = %s)", numParam, codeParam)
+		} else {
+			numberExactExpr = fmt.Sprintf("(i.number = %s AND i.number_code = '')", numParam)
+		}
+	}
 
 	terminalStatusesParam := ""
 	if !includeClosed {
@@ -876,7 +912,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 		fmt.Sprintf("COALESCE(%s LIKE %s, FALSE) AS description_phrase", loweredIssueDescription, phraseContainsParam),
 	}
 	if hasNum {
-		issueFlagColumns = append(issueFlagColumns, fmt.Sprintf("i.number = %s AS number_exact", numParam))
+		issueFlagColumns = append(issueFlagColumns, fmt.Sprintf("%s AS number_exact", numberExactExpr))
 	}
 	for index, termParam := range termContainsParams {
 		issueFlagColumns = append(issueFlagColumns,
@@ -1928,7 +1964,14 @@ func appendIssueTableSearchFilter(where []string, addArg func(any) string, raw s
 		ors = append(ors, "("+strings.Join(titleMatches, " AND ")+")")
 	}
 	if number, ok := parseQueryNumber(query); ok {
-		ors = append(ors, fmt.Sprintf("i.number = %s", addArg(number)))
+		// Scope the number match to the sequence the query names, mirroring
+		// buildSearchQuery: a three-part identifier targets that project's
+		// sequence, everything else only the workspace-numbered one.
+		if code := identifierQueryCode(query); code != "" {
+			ors = append(ors, fmt.Sprintf("(i.number = %s AND i.number_code = %s)", addArg(number), addArg(code)))
+		} else {
+			ors = append(ors, fmt.Sprintf("(i.number = %s AND i.number_code = '')", addArg(number)))
+		}
 	}
 	if len(ors) == 0 {
 		return where
@@ -4470,7 +4513,7 @@ func (h *Handler) publishClearedDuplicates(ctx context.Context, cleared []cleare
 			"issue":                        response,
 			"duplicate_of_issue_id":        liveDuplicateMark(c.Issue.Status, c.Issue.DuplicateOfIssueID),
 			"prev_duplicate_of_issue_id":   liveDuplicateMark(c.Issue.Status, c.Original.ID),
-			"prev_duplicate_of_identifier": prefix + "-" + strconv.Itoa(int(c.Original.Number)),
+			"prev_duplicate_of_identifier": service.IssueIdentifier(prefix, c.Original.NumberCode, c.Original.Number),
 		})
 	}
 }

@@ -174,6 +174,8 @@ export const ProjectSchema = z.object({
   updated_at: z.string(),
   issue_count: z.number().default(0),
   done_count: z.number().default(0),
+  // .default("") for older backends that predate project codes.
+  code: z.string().default(""),
   resource_count: z.number().default(0),
 }).loose();
 
@@ -209,6 +211,7 @@ export const EMPTY_PROJECT: Project = {
   updated_at: "",
   issue_count: 0,
   done_count: 0,
+  code: "",
   resource_count: 0,
 };
 

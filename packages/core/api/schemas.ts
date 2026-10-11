@@ -1414,6 +1414,8 @@ const ProjectSchema = z.object({
   updated_at: z.string(),
   issue_count: z.number().default(0),
   done_count: z.number().default(0),
+  // .default("") for older backends that predate project codes.
+  code: z.string().default(""),
   resource_count: z.number().default(0),
 }).loose();
 
