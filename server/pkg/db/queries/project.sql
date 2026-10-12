@@ -26,24 +26,38 @@ FOR UPDATE;
 -- name: CreateProject :one
 INSERT INTO project (
     workspace_id, title, description, icon, status,
-    lead_type, lead_id, priority, start_date, due_date
+    lead_type, lead_id, priority, start_date, due_date, code
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 ) RETURNING *;
 
 -- name: UpdateProject :one
 UPDATE project SET
     title = COALESCE(sqlc.narg('title'), title),
-    description = sqlc.narg('description'),
-    icon = sqlc.narg('icon'),
+    description = CASE WHEN sqlc.arg('description_set')::boolean THEN sqlc.narg('description') ELSE description END,
+    icon = CASE WHEN sqlc.arg('icon_set')::boolean THEN sqlc.narg('icon') ELSE icon END,
     status = COALESCE(sqlc.narg('status'), status),
     priority = COALESCE(sqlc.narg('priority'), priority),
-    lead_type = sqlc.narg('lead_type'),
-    lead_id = sqlc.narg('lead_id'),
-    start_date = sqlc.narg('start_date'),
-    due_date = sqlc.narg('due_date'),
+    lead_type = CASE WHEN sqlc.arg('lead_type_set')::boolean THEN sqlc.narg('lead_type') ELSE lead_type END,
+    lead_id = CASE WHEN sqlc.arg('lead_id_set')::boolean THEN sqlc.narg('lead_id') ELSE lead_id END,
+    start_date = CASE WHEN sqlc.arg('start_date_set')::boolean THEN sqlc.narg('start_date') ELSE start_date END,
+    due_date = CASE WHEN sqlc.arg('due_date_set')::boolean THEN sqlc.narg('due_date') ELSE due_date END,
+    code = CASE WHEN sqlc.arg('code_set')::boolean THEN sqlc.narg('code') ELSE code END,
     updated_at = now()
 WHERE id = $1
+RETURNING *;
+
+-- name: IncrementProjectIssueCounter :one
+UPDATE project SET issue_counter = issue_counter + 1
+WHERE id = $1
+RETURNING issue_counter;
+
+-- name: SetProjectCodeIfEmpty :one
+-- Claims a lazily derived code for a legacy project. Returns no rows when
+-- another transaction already assigned a code; the caller must then re-read
+-- the project row and use the winner's code.
+UPDATE project SET code = $2
+WHERE id = $1 AND code = ''
 RETURNING *;
 
 -- name: DeleteProject :exec

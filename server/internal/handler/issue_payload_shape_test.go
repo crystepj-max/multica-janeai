@@ -112,11 +112,14 @@ func TestIssueToMap_UnsetJSONBagsAreEmptyObjects(t *testing.T) {
 // stray "-42", and the chat reply and the broadcast payload must not disagree
 // about it (both call service.IssueIdentifier).
 func TestIssueIdentifier_DegradesWithoutPrefix(t *testing.T) {
-	if got := service.IssueIdentifier("MUL", 42); got != "MUL-42" {
-		t.Errorf("IssueIdentifier(\"MUL\", 42) = %q; want MUL-42", got)
+	if got := service.IssueIdentifier("MUL", "", 42); got != "MUL-42" {
+		t.Errorf("IssueIdentifier(\"MUL\", \"\", 42) = %q; want MUL-42", got)
 	}
-	if got := service.IssueIdentifier("", 42); got != "#42" {
-		t.Errorf("IssueIdentifier(\"\", 42) = %q; want #42", got)
+	if got := service.IssueIdentifier("", "", 42); got != "#42" {
+		t.Errorf("IssueIdentifier(\"\", \"\", 42) = %q; want #42", got)
+	}
+	if got := service.IssueIdentifier("MUL", "APP", 42); got != "MUL-APP-42" {
+		t.Errorf("IssueIdentifier(\"MUL\", \"APP\", 42) = %q; want MUL-APP-42", got)
 	}
 }
 

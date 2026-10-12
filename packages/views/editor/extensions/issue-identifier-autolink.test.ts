@@ -114,6 +114,19 @@ describe("createIssueIdentifierAutolinkExtension", () => {
     );
   });
 
+  it("converts a project-numbered three-part identifier", async () => {
+    resolveMock.mockResolvedValue({ id: "uuid-2", identifier: "MUL-APP-7" });
+    editor = makeEditor();
+
+    typeAt1(editor, "MUL-APP-7 ");
+    await flush();
+
+    expect(resolveMock).toHaveBeenCalledWith("MUL-APP-7");
+    expect(editor.getMarkdown().trim()).toBe(
+      "[MUL-APP-7](mention://issue/uuid-2)",
+    );
+  });
+
   it("leaves an unresolvable identifier as plain text", async () => {
     resolveMock.mockResolvedValue(null);
     editor = makeEditor();

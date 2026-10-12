@@ -14,6 +14,7 @@ import {
   EMPTY_LIST_TELEGRAM_INSTALLATIONS_RESPONSE,
   EMPTY_REDEEM_TELEGRAM_BINDING_TOKEN_RESPONSE,
   AgentTaskListSchema,
+  AgentActivityBucketListSchema,
   TaskMessageListSchema,
   AutopilotQuotaUsageSchema,
   AutopilotRunSchema,
@@ -1581,6 +1582,24 @@ describe("SearchProjectsResponseSchema date drift", () => {
     expect(parsed.projects[0]?.start_date).toBeNull();
     expect(parsed.projects[0]?.due_date).toBeNull();
   });
+
+  it("parses the project code and defaults it to empty on older backends", () => {
+    const withCode = parseWithFallback(
+      { projects: [{ ...baseProject, code: "QTZ" }], total: 1 },
+      SearchProjectsResponseSchema,
+      EMPTY_SEARCH_PROJECTS_RESPONSE,
+      ENDPOINT,
+    );
+    expect(withCode.projects[0]?.code).toBe("QTZ");
+
+    const withoutCode = parseWithFallback(
+      { projects: [baseProject], total: 1 },
+      SearchProjectsResponseSchema,
+      EMPTY_SEARCH_PROJECTS_RESPONSE,
+      ENDPOINT,
+    );
+    expect(withoutCode.projects[0]?.code).toBe("");
+  });
 });
 
 // The "run now" flow branches on run.status/reason_code to avoid a false-success
@@ -2352,5 +2371,21 @@ describe("TaskMessageListSchema", () => {
   it("downgrades an unknown message type instead of dropping the transcript", () => {
     const parsed = TaskMessageListSchema.parse([{ ...row, type: "video" }]);
     expect(parsed[0]?.type).toBe("text");
+  });
+});
+
+
+describe("AgentActivityBucketListSchema duration", () => {
+  const bucket = { agent_id: "a", bucket_at: "2026-09-24T00:00:00Z", task_count: 201,
+    completed_count: 201, failed_count: 0, cancelled_count: 0 };
+  it("accepts optional aggregate duration from new and old servers", () => {
+    expect(AgentActivityBucketListSchema.parse([bucket])[0]?.duration_ms).toBeUndefined();
+    expect(AgentActivityBucketListSchema.parse([{ ...bucket, duration_ms: 12600000, duration_count: 201 }])[0]?.duration_count).toBe(201);
+  });
+  it("does not discard activity counts when duration is malformed", () => {
+    const parsed = AgentActivityBucketListSchema.parse([{ ...bucket, duration_ms: "slow", duration_count: -1 }]);
+    expect(parsed[0]?.task_count).toBe(201);
+    expect(parsed[0]?.duration_ms).toBeUndefined();
+    expect(parsed[0]?.duration_count).toBeUndefined();
   });
 });

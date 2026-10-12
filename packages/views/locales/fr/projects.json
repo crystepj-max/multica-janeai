@@ -70,6 +70,8 @@
     "section_description": "Description",
     "prop_start_date": "Date de début",
     "prop_due_date": "Date d'échéance",
+    "prop_code": "Code",
+    "code_tooltip": "Code utilisé dans les identifiants de tickets (PRÉFIXE-CODE-N). La modification n'affecte que les tickets créés ensuite.",
     "no_start_date": "Aucune date de début",
     "no_due_date": "Aucune date d'échéance",
     "description_placeholder": "Ajouter une description...",

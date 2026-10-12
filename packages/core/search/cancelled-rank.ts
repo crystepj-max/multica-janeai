@@ -24,9 +24,19 @@ import { issueBehavesAs } from "../issues/status-category";
 
 /**
  * Mirrors the server's identifier pattern (parseQueryNumber in
- * server/internal/handler/issue.go): "MUL-123" or a bare "123".
+ * server/internal/handler/issue.go): "MUL-123", "V2-12", the
+ * project-numbered three-part form "MUL-APP-7", or a bare "123".
  */
-const IDENTIFIER_NUMBER_RE = /^[a-z]+-(\d+)$/i;
+const IDENTIFIER_NUMBER_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]{1,10})?-(\d+)$/i;
+
+/**
+ * Extracts the project-code segment of a three-part identifier
+ * ("MUL-APP-7" → "APP"), or "" for two-part identifiers and bare numbers.
+ */
+function parseSearchQueryCode(query: string): string {
+  const m = /^[a-z][a-z0-9]*-([a-z0-9]{1,10})-(\d+)$/i.exec(query.trim());
+  return m ? m[1]!.toUpperCase() : "";
+}
 
 /** Extracts the issue number a query targets, or null when it targets none. */
 export function parseSearchQueryNumber(query: string): number | null {
@@ -77,7 +87,17 @@ export function isIssueDirectHit(
     const issueNumber =
       issue.number ??
       (issue.identifier ? parseSearchQueryNumber(issue.identifier) : null);
-    if (issueNumber === targetNumber) return true;
+    if (issueNumber === targetNumber) {
+      // Mirror the server's number_exact scoping: a three-part query targets
+      // that project's sequence, while a two-part identifier or a bare number
+      // only ever targets the workspace-numbered sequence — "MUL-7" must not
+      // direct-hit MUL-APP-7 just because the numbers collide.
+      const queryCode = parseSearchQueryCode(query);
+      const issueCode = issue.identifier
+        ? parseSearchQueryCode(issue.identifier)
+        : "";
+      if (issueCode === queryCode) return true;
+    }
   }
   if (
     issue.identifier &&

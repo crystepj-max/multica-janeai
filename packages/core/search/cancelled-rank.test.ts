@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect } from "vitest";
 import type { SearchIssueResult, SearchProjectResult } from "../types/api";
 import {
@@ -39,6 +40,29 @@ describe("parseSearchQueryNumber", () => {
     expect(parseSearchQueryNumber("  123 ")).toBe(123);
   });
 
+  it("reads the number from a project-numbered three-part identifier", () => {
+    expect(parseSearchQueryNumber("MUL-APP-7")).toBe(7);
+    expect(parseSearchQueryNumber("mul-app-7")).toBe(7);
+  });
+
+  it("reads a three-part identifier with a digit-containing prefix", () => {
+    expect(parseSearchQueryNumber("V2-APP-7")).toBe(7);
+  });
+
+  it.each([
+    ["V2-12", 12],
+    ["  v2-12  ", 12],
+    ["A1-7", 7],
+    ["a1b2-42", 42],
+  ])("reads a digit-containing prefix in %s", (query, number) => {
+    expect(parseSearchQueryNumber(query)).toBe(number);
+  });
+
+  it.each(["12-3", "2FAS-1", "V2-0", "V2--12", "V2-12x", "V_2-12"])(
+    "does not read %s as an issue number",
+    (query) => expect(parseSearchQueryNumber(query)).toBeNull(),
+  );
+
   it("returns null for anything that is not a target", () => {
     expect(parseSearchQueryNumber("search")).toBeNull();
     expect(parseSearchQueryNumber("MUL-")).toBeNull();
@@ -54,6 +78,12 @@ describe("direct hits", () => {
     expect(isIssueDirectHit(it1, "42")).toBe(true);
     expect(isIssueDirectHit(it1, "  ship IT ")).toBe(true);
     expect(isIssueDirectHit(it1, "ship")).toBe(false);
+  });
+
+  it("treats a project-numbered identifier as targeting its issue", () => {
+    const it1 = issue({ id: "i1", number: 7, identifier: "MUL-APP-7", title: "Ship it" });
+    expect(isIssueDirectHit(it1, "MUL-APP-7")).toBe(true);
+    expect(isIssueDirectHit(it1, "MUL-7")).toBe(false);
   });
 
   it("treats only an exact title as targeting the project", () => {

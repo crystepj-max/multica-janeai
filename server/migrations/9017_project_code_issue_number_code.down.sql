@@ -1,0 +1,3 @@
+ALTER TABLE project DROP COLUMN IF EXISTS issue_counter;
+ALTER TABLE project DROP COLUMN IF EXISTS code;
+ALTER TABLE issue DROP COLUMN IF EXISTS number_code;

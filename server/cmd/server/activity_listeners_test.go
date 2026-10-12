@@ -480,7 +480,7 @@ func testIssueIdentifier(t *testing.T, queries *db.Queries, issueID string) stri
 	if err != nil {
 		t.Fatalf("GetWorkspace: %v", err)
 	}
-	return service.IssueIdentifier(ws.IssuePrefix, issue.Number)
+	return service.IssueIdentifier(ws.IssuePrefix, issue.NumberCode, issue.Number)
 }
 
 func newDuplicateTestIssues(t *testing.T, queries *db.Queries) (bus *events.Bus, duplicateID, originalID string) {

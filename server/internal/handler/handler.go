@@ -318,6 +318,8 @@ type Handler struct {
 	// where the storage backend exists; main.go starts it as an independent
 	// worker goroutine. Nil when no storage backend is configured.
 	ChannelMediaReconciler *service.ChannelMediaReconciler
+	// LarkTyping owns the durable reaction cleanup worker, started under sweepCtx.
+	LarkTyping *lark.TypingIndicatorManager
 	// SlackInstall owns the bring-your-own-app Slack install lifecycle (register
 	// pasted tokens / list / revoke) and the at-rest encryption of each app's bot
 	// + app tokens (MUL-3666). Nil unless MULTICA_SLACK_SECRET_KEY is set.
@@ -534,6 +536,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		slog.Warn("github: PR snapshot pipeline disabled (invalid App private key)", "err", err)
 	}
 	h.PRRefresh = ghsnapshot.NewManager(ghClient, queries, txStarter, h.broadcastPRSnapshotApplied)
+	taskSvc.PRSnapshotsEnabled = h.PRRefresh.Enabled()
 
 	return h
 }
@@ -1084,13 +1087,20 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 	return issue, true
 }
 
-// resolveIssueByIdentifier tries to look up an issue by "PREFIX-NUMBER" format.
+// resolveIssueByIdentifier tries to look up an issue by "PREFIX-NUMBER" or
+// "PREFIX-CODE-NUMBER" format.
 //
 // The prefix must match the workspace's own issue prefix, the same rule
 // `lookupIssueByIdentifier` applies to VCS webhooks. Without it every prefix
 // resolved to the same issue number, so `FOO-134` and `TRS-134` were
 // interchangeable — which makes the identifier URL `/{ws}/issues/{key}`
 // unusable as a canonical link.
+//
+// A three-part identifier resolves through the issue's creation-time code
+// snapshot, so it keeps resolving after project renames or project deletion.
+// A two-part identifier only ever matches workspace-numbered issues (the same
+// rule GetIssueByNumber applies), so a project issue reusing the number can
+// never hijack the legacy form.
 func (h *Handler) resolveIssueByIdentifier(ctx context.Context, id, workspaceID string) (db.Issue, bool) {
 	parts := splitIdentifier(id)
 	if parts == nil {
@@ -1108,6 +1118,17 @@ func (h *Handler) resolveIssueByIdentifier(ctx context.Context, id, workspaceID 
 	if prefix == "" || !strings.EqualFold(parts.prefix, prefix) {
 		return db.Issue{}, false
 	}
+	if parts.code != "" {
+		issue, err := h.Queries.GetIssueByNumberCode(ctx, db.GetIssueByNumberCodeParams{
+			WorkspaceID: wsUUID,
+			NumberCode:  strings.ToUpper(parts.code),
+			Number:      parts.number,
+		})
+		if err != nil {
+			return db.Issue{}, false
+		}
+		return issue, true
+	}
 	issue, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
 		WorkspaceID: wsUUID,
 		Number:      parts.number,
@@ -1120,6 +1141,7 @@ func (h *Handler) resolveIssueByIdentifier(ctx context.Context, id, workspaceID 
 
 type identifierParts struct {
 	prefix string
+	code   string
 	number int32
 }
 
@@ -1151,7 +1173,41 @@ func splitIdentifier(id string) *identifierParts {
 	if num <= 0 {
 		return nil
 	}
-	return &identifierParts{prefix: id[:idx], number: int32(num)}
+	head := id[:idx]
+	parts := &identifierParts{number: int32(num)}
+	// Optional project-code middle segment ("MUL-APP-42"): split head at its
+	// last dash. "MUL-42" has none and stays a plain prefix.
+	if cIdx := strings.LastIndexByte(head, '-'); cIdx > 0 && cIdx < len(head)-1 {
+		parts.code = head[cIdx+1:]
+		parts.prefix = head[:cIdx]
+	} else {
+		parts.prefix = head
+	}
+	if parts.prefix == "" {
+		return nil
+	}
+	if parts.code != "" && !isValidProjectCodeSegment(parts.code) {
+		return nil
+	}
+	return parts
+}
+
+// isValidProjectCodeSegment validates the middle segment of a three-part
+// identifier: 1-10 letters/digits, mirroring the project code rules. Lowercase
+// is accepted here so a hand-typed `mul-app-42` resolves; the lookup
+// normalizes case.
+func isValidProjectCodeSegment(code string) bool {
+	if len(code) == 0 || len(code) > service.MaxProjectCodeLen {
+		return false
+	}
+	for _, c := range code {
+		alnum := (c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if !alnum {
+			return false
+		}
+	}
+	return true
 }
 
 // issuePrefixForWorkspace resolves a workspace row's effective issue prefix:

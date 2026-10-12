@@ -69,6 +69,8 @@
     "section_description": "描述",
     "prop_start_date": "开始日期",
     "prop_due_date": "截止日期",
+    "prop_code": "代码",
+    "code_tooltip": "用于任务编号（前缀-代码-数字）。修改只影响之后新建的任务。",
     "no_start_date": "无开始日期",
     "no_due_date": "无截止日期",
     "description_placeholder": "添加描述...",

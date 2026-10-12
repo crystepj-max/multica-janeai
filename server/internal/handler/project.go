@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -39,6 +40,10 @@ type ProjectResponse struct {
 	UpdatedAt  string  `json:"updated_at"`
 	IssueCount int64   `json:"issue_count"`
 	DoneCount  int64   `json:"done_count"`
+	// Code is the middle segment of the project-numbered identifier
+	// ("PREFIX-CODE-N"). Empty for legacy projects whose first issue has not
+	// lazily derived one yet.
+	Code string `json:"code"`
 	// ResourceCount is a breadcrumb pointing at the sub-collection at
 	// /api/projects/{id}/resources. Resources themselves stay out of this
 	// payload to keep parent metadata and child collections separate; clients
@@ -61,6 +66,7 @@ func projectToResponse(p db.Project) ProjectResponse {
 		DueDate:     dateToPtr(p.DueDate),
 		CreatedAt:   timestampToString(p.CreatedAt),
 		UpdatedAt:   timestampToString(p.UpdatedAt),
+		Code:        p.Code,
 	}
 }
 
@@ -108,6 +114,7 @@ type CreateProjectRequest struct {
 	LeadID      *string                               `json:"lead_id"`
 	StartDate   *string                               `json:"start_date"`
 	DueDate     *string                               `json:"due_date"`
+	Code        *string                               `json:"code"`
 	Resources   []CreateProjectResourceRequestPayload `json:"resources,omitempty"`
 }
 
@@ -131,6 +138,7 @@ type UpdateProjectRequest struct {
 	LeadID      *string `json:"lead_id"`
 	StartDate   *string `json:"start_date"`
 	DueDate     *string `json:"due_date"`
+	Code        *string `json:"code"`
 }
 
 func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
@@ -243,16 +251,32 @@ func validateProjectEnum(w http.ResponseWriter, field, value string, allowed []s
 // writeProjectWriteError maps a failed project INSERT/UPDATE to an HTTP
 // response. A CHECK constraint violation is a client error (400) — pre-validation
 // already covers status/priority, so this backstops any other constrained column
-// (e.g. lead_type). Anything else is a genuine server fault: log the underlying
-// error so transient DB failures are diagnosable (#3925 had no server-side
-// signal) and return 500.
+// (e.g. lead_type). A unique violation is a client error too (409): the only
+// unique index on project is the per-workspace code. Anything else is a
+// genuine server fault: log the underlying error so transient DB failures are
+// diagnosable (#3925 had no server-side signal) and return 500.
 func (h *Handler) writeProjectWriteError(w http.ResponseWriter, r *http.Request, err error, action string) {
 	if isCheckViolation(err) {
 		writeError(w, http.StatusBadRequest, "project "+action+" rejected: a field value failed a database constraint")
 		return
 	}
+	if isUniqueViolation(err) {
+		writeError(w, http.StatusConflict, "this code is already used by another project in the workspace")
+		return
+	}
 	slog.Error("project "+action+" failed", append(logger.RequestAttrs(r), "error", err)...)
 	writeError(w, http.StatusInternalServerError, "failed to "+action+" project")
+}
+
+// nextProjectCodeOnConflict returns the code with a numeric suffix appended
+// for the next derivation attempt, or ok=false when the code was explicitly
+// chosen (a silent rename would surprise the caller — surface a 409 instead)
+// or the suffix space is exhausted.
+func nextProjectCodeOnConflict(code string, explicit bool, attempt int) (string, bool) {
+	if explicit || attempt >= 99 {
+		return "", false
+	}
+	return fmt.Sprintf("%s%d", code, attempt+1), true
 }
 
 func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
@@ -367,6 +391,24 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Project code: an explicit client value wins; otherwise derive one from
+	// the title (pinyin initials for Chinese characters). A derived code that
+	// collides within the workspace retries with a numeric suffix; an explicit
+	// one that collides surfaces a 409.
+	explicitCode := false
+	code := ""
+	if req.Code != nil {
+		code = service.NormalizeProjectCode(*req.Code)
+		explicitCode = code != ""
+		if code != "" && len(code) > service.MaxProjectCodeLen {
+			writeError(w, http.StatusBadRequest, "code must be at most "+strconv.Itoa(service.MaxProjectCodeLen)+" letters/digits")
+			return
+		}
+	}
+	if code == "" {
+		code = service.DefaultProjectCodeFromTitle(req.Title)
+	}
+
 	createParams := db.CreateProjectParams{
 		WorkspaceID: wsUUID,
 		Title:       req.Title,
@@ -378,11 +420,27 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 		Priority:    priority,
 		StartDate:   startDate,
 		DueDate:     dueDate,
+		Code:        code,
+	}
+
+	// Insert with code-conflict retries around a derived code. Both paths
+	// (plain and transactional) share it; only one runs per request.
+	insertProject := func(q *db.Queries) (db.Project, error) {
+		p, err := q.CreateProject(r.Context(), createParams)
+		for attempt := 1; err != nil && isUniqueViolation(err); attempt++ {
+			next, ok := nextProjectCodeOnConflict(createParams.Code, explicitCode, attempt)
+			if !ok {
+				break
+			}
+			createParams.Code = next
+			p, err = q.CreateProject(r.Context(), createParams)
+		}
+		return p, err
 	}
 
 	// Without resources, keep the simple non-tx path.
 	if len(req.Resources) == 0 {
-		project, err := h.Queries.CreateProject(r.Context(), createParams)
+		project, err := insertProject(h.Queries)
 		if err != nil {
 			h.writeProjectWriteError(w, r, err, "create")
 			return
@@ -402,7 +460,7 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 	qtx := h.Queries.WithTx(tx)
 
-	project, err := qtx.CreateProject(r.Context(), createParams)
+	project, err := insertProject(qtx)
 	if err != nil {
 		h.writeProjectWriteError(w, r, err, "create")
 		return
@@ -503,15 +561,14 @@ func (h *Handler) UpdateProject(w http.ResponseWriter, r *http.Request) {
 	var rawFields map[string]json.RawMessage
 	json.Unmarshal(bodyBytes, &rawFields)
 
-	params := db.UpdateProjectParams{
-		ID:          prevProject.ID,
-		Description: prevProject.Description,
-		Icon:        prevProject.Icon,
-		LeadType:    prevProject.LeadType,
-		LeadID:      prevProject.LeadID,
-		StartDate:   prevProject.StartDate,
-		DueDate:     prevProject.DueDate,
-	}
+	params := db.UpdateProjectParams{ID: prevProject.ID}
+	_, params.DescriptionSet = rawFields["description"]
+	_, params.IconSet = rawFields["icon"]
+	_, params.LeadTypeSet = rawFields["lead_type"]
+	_, params.LeadIDSet = rawFields["lead_id"]
+	_, params.StartDateSet = rawFields["start_date"]
+	_, params.DueDateSet = rawFields["due_date"]
+	_, params.CodeSet = rawFields["code"]
 	if req.Title != nil {
 		params.Title = pgtype.Text{String: *req.Title, Valid: true}
 	}
@@ -584,6 +641,22 @@ func (h *Handler) UpdateProject(w http.ResponseWriter, r *http.Request) {
 		} else {
 			params.DueDate = pgtype.Date{Valid: false} // explicit null = clear date
 		}
+	}
+	// The code only moves forward: a present key must carry a usable value.
+	// Clearing it is rejected rather than silently ignored, and a rename never
+	// rewrites identifiers already issued (issues snapshot the code at
+	// creation).
+	if _, ok := rawFields["code"]; ok {
+		if req.Code == nil {
+			writeError(w, http.StatusBadRequest, "code cannot be cleared")
+			return
+		}
+		code := service.NormalizeProjectCode(*req.Code)
+		if code == "" || len(code) > service.MaxProjectCodeLen {
+			writeError(w, http.StatusBadRequest, "code must be 1-"+strconv.Itoa(service.MaxProjectCodeLen)+" letters/digits")
+			return
+		}
+		params.Code = pgtype.Text{String: code, Valid: true}
 	}
 	project, err := h.Queries.UpdateProject(r.Context(), params)
 	if err != nil {

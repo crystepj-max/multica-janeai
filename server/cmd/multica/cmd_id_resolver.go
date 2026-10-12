@@ -203,6 +203,23 @@ func looksLikeIssueIdentifier(input string) bool {
 		return false
 	}
 	prefix := input[:dash]
+	// Optional project-code middle segment ("MUL-APP-7"): peel it off so the
+	// remaining head can be validated as the plain workspace prefix.
+	if c := strings.LastIndex(prefix, "-"); c >= 0 {
+		code := prefix[c+1:]
+		if code == "" || len(code) > 10 {
+			return false
+		}
+		for _, r := range code {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+				return false
+			}
+		}
+		prefix = prefix[:c]
+	}
+	if prefix == "" {
+		return false
+	}
 	for _, r := range prefix {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
 			return false

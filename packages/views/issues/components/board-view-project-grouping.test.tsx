@@ -83,6 +83,7 @@ function makeProject(id: string, title: string, icon: string | null): Project {
     icon,
     status: "in_progress",
     priority: "none",
+    code: "",
     lead_type: null,
     lead_id: null,
     start_date: null,

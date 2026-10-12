@@ -7,7 +7,7 @@
 -- "Assigned to me"), and the two filters must produce disjoint result sets.
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id, i.metadata, i.stage, i.properties,
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.number_code, i.project_id, i.metadata, i.stage, i.properties,
        i.revision, i.duplicate_of_issue_id
 FROM issue i
 WHERE i.workspace_id = $1
@@ -182,15 +182,26 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
+    number_code,
     stage, properties, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+    $16,
     sqlc.narg('stage'), COALESCE(sqlc.narg('properties')::jsonb, '{}'::jsonb), now(), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 ) RETURNING *;
 
 -- name: GetIssueByNumber :one
+-- Workspace-numbered issues only: a bare "PREFIX-N" identifier must never
+-- resolve to a project-numbered issue that happens to reuse the number.
 SELECT * FROM issue
-WHERE workspace_id = $1 AND number = $2;
+WHERE workspace_id = $1 AND number = $2 AND number_code = '';
+
+-- name: GetIssueByNumberCode :one
+-- Project-numbered lookup for three-segment identifiers ("PREFIX-CODE-N").
+-- Matches the creation-time number_code snapshot, so identifiers keep
+-- resolving after project renames or project deletion.
+SELECT * FROM issue
+WHERE workspace_id = $1 AND number_code = $2 AND number = $3;
 
 -- name: UpdateIssue :one
 WITH wakeup_source AS MATERIALIZED (SELECT set_config('multica.source_task_id', COALESCE(sqlc.narg('source_task_id')::uuid::text, ''), true)), candidate AS MATERIALIZED (
@@ -381,13 +392,13 @@ ORDER BY created_at ASC, id ASC;
 
 -- name: GetIssueRefInWorkspace :one
 -- The summary a duplicate's response carries for its original (MUL-7349).
-SELECT id, number, title, status FROM issue
+SELECT id, number, number_code, title, status FROM issue
 WHERE id = $1 AND workspace_id = $2;
 
 -- name: ListIssueRefsInWorkspace :many
 -- GetIssueRefInWorkspace for a page: every original the page's duplicates
 -- point at, in one read.
-SELECT id, number, title, status FROM issue
+SELECT id, number, number_code, title, status FROM issue
 WHERE workspace_id = sqlc.arg('workspace_id')
   AND id = ANY(sqlc.arg('ids')::uuid[]);
 
@@ -410,9 +421,11 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
+    number_code,
     origin_type, origin_id, stage, properties, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+    $16,
     sqlc.narg('origin_type'), sqlc.narg('origin_id'), sqlc.narg('stage'), COALESCE(sqlc.narg('properties')::jsonb, '{}'::jsonb), now(), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 ) RETURNING *;
 
@@ -484,6 +497,9 @@ cleared_wakeup_receipts AS (
 cleared_wakeups AS (
  DELETE FROM issue_wakeup WHERE issue_id IN (SELECT target.id FROM target)
 ),
+cleared_child_events AS (
+ DELETE FROM issue_child_event WHERE parent_id IN (SELECT target.id FROM target) OR child_id IN (SELECT target.id FROM target)
+),
 cleared_task_supplements AS (
  DELETE FROM task_supplement WHERE issue_id IN (SELECT target.id FROM target)
 ),
@@ -506,7 +522,7 @@ DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target);
 -- filter; member-direct assignment is intentionally excluded).
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id, i.metadata, i.stage, i.properties,
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.number_code, i.project_id, i.metadata, i.stage, i.properties,
        i.revision, i.duplicate_of_issue_id
 FROM issue i
 WHERE i.workspace_id = $1

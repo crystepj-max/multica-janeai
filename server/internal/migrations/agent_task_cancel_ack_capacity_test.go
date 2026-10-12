@@ -59,7 +59,7 @@ func TestAgentTaskCancelAckCapacityDownRefusesLiveWork(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("create task queue fixture: %v", err)
 	}
-	applyMigrationFile(t, ctx, conn.Conn(), "552_agent_task_cancel_ack_capacity.up.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "9012_agent_task_cancel_ack_capacity.up.sql")
 
 	taskID := uuid.NewString()
 	if _, err := conn.Exec(ctx, `INSERT INTO agent_task_queue (id, status) VALUES ($1, 'running')`, taskID); err != nil {
@@ -84,7 +84,7 @@ func TestAgentTaskCancelAckCapacityDownRefusesLiveWork(t *testing.T) {
 	if _, err := conn.Exec(ctx, `UPDATE agent_task_queue SET cancel_ack_pending = FALSE WHERE id = $1`, taskID); err != nil {
 		t.Fatalf("acknowledge stopped task fixture: %v", err)
 	}
-	applyMigrationFile(t, ctx, conn.Conn(), "552_agent_task_cancel_ack_capacity.down.sql")
+	applyMigrationFile(t, ctx, conn.Conn(), "9012_agent_task_cancel_ack_capacity.down.sql")
 	var columnExists bool
 	if err := conn.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -105,7 +105,7 @@ func expectCancelAckCapacityDownRefusal(t *testing.T, ctx context.Context, conn 
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }) {
 	t.Helper()
-	_, err := conn.Exec(ctx, readMigrationFile(t, "552_agent_task_cancel_ack_capacity.down.sql"))
+	_, err := conn.Exec(ctx, readMigrationFile(t, "9012_agent_task_cancel_ack_capacity.down.sql"))
 	if err == nil || !strings.Contains(err.Error(), "cannot roll back agent task cancellation acknowledgements") {
 		t.Fatalf("down migration error = %v, want refusal while live work remains", err)
 	}

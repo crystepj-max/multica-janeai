@@ -90,7 +90,7 @@ type IssueCreateParams struct {
 	Properties     map[pgtype.UUID]json.RawMessage
 	AllowDuplicate bool
 	// Stage groups this issue into an ordered barrier group under its parent
-	// (NULL = unstaged). See issue_child_done.go for the staged-barrier wake.
+	// (NULL = unstaged). See issue_wakeup_system.go for the staged-barrier wake.
 	Stage pgtype.Int4
 	// SourceContext is set only by the comment-scoped manual create endpoint.
 	// Its immutable snapshot and cloned attachment rows commit in the same
@@ -314,13 +314,24 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			projectID = parent.ProjectID
 		}
 	}
+	var project *db.Project
 	if projectID.Valid {
-		if _, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
+		row, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
 			ID:          projectID,
 			WorkspaceID: p.WorkspaceID,
-		}); err != nil {
+		})
+		if err != nil {
 			return IssueCreateResult{}, ErrProjectNotFound
 		}
+		// Legacy projects carry code = '' until their first issue lazily
+		// derives and claims one; the claim rolls back with this create if
+		// it fails.
+		code, err := EnsureProjectCode(ctx, qtx, row)
+		if err != nil {
+			return IssueCreateResult{}, fmt.Errorf("project code: %w", err)
+		}
+		row.Code = code
+		project = &row
 	}
 
 	// Validate labels before we increment the issue counter so a stale or
@@ -341,7 +352,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		return IssueCreateResult{DuplicateIssue: &dup}, ErrActiveDuplicate
 	}
 
-	issueNumber, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, issueCountPolicy)
+	issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, project, issueCountPolicy)
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("allocate issue number: %w", err)
 	}
@@ -362,8 +373,38 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 
 	var issue db.Issue
 	var assignedTask db.AgentTaskQueue
-	if p.OriginType.Valid {
-		issue, err = qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
+	// A project code can outlive its project: deleting a project keeps the
+	// snapshot code on its issues, and a later project deriving the same code
+	// starts its counter at 1, so the first insert can land on a number a
+	// ghost snapshot already holds. Take the next number instead of failing
+	// the create (bounded, so a corrupt sequence surfaces as an error).
+	insertIssue := func(number int32, numberCode string) (db.Issue, error) {
+		if p.OriginType.Valid {
+			return qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
+				ID:            dbid.NewV7(),
+				WorkspaceID:   p.WorkspaceID,
+				Title:         p.Title,
+				Description:   p.Description,
+				Status:        p.Status,
+				Priority:      p.Priority,
+				AssigneeType:  p.AssigneeType,
+				AssigneeID:    p.AssigneeID,
+				CreatorType:   p.CreatorType,
+				CreatorID:     p.CreatorID,
+				ParentIssueID: p.ParentIssueID,
+				Position:      newPosition,
+				StartDate:     p.StartDate,
+				DueDate:       p.DueDate,
+				Number:        number,
+				ProjectID:     projectID,
+				NumberCode:    numberCode,
+				OriginType:    p.OriginType,
+				OriginID:      p.OriginID,
+				Stage:         p.Stage,
+				Properties:    properties,
+			})
+		}
+		return qtx.CreateIssue(ctx, db.CreateIssueParams{
 			ID:            dbid.NewV7(),
 			WorkspaceID:   p.WorkspaceID,
 			Title:         p.Title,
@@ -378,37 +419,35 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			Position:      newPosition,
 			StartDate:     p.StartDate,
 			DueDate:       p.DueDate,
-			Number:        issueNumber,
+			Number:        number,
 			ProjectID:     projectID,
-			OriginType:    p.OriginType,
-			OriginID:      p.OriginID,
-			Stage:         p.Stage,
-			Properties:    properties,
-		})
-	} else {
-		issue, err = qtx.CreateIssue(ctx, db.CreateIssueParams{
-			ID:            dbid.NewV7(),
-			WorkspaceID:   p.WorkspaceID,
-			Title:         p.Title,
-			Description:   p.Description,
-			Status:        p.Status,
-			Priority:      p.Priority,
-			AssigneeType:  p.AssigneeType,
-			AssigneeID:    p.AssigneeID,
-			CreatorType:   p.CreatorType,
-			CreatorID:     p.CreatorID,
-			ParentIssueID: p.ParentIssueID,
-			Position:      newPosition,
-			StartDate:     p.StartDate,
-			DueDate:       p.DueDate,
-			Number:        issueNumber,
-			ProjectID:     projectID,
+			NumberCode:    numberCode,
 			Stage:         p.Stage,
 			Properties:    properties,
 		})
 	}
-	if err != nil {
+	// The first allocation above takes the serialization locks before
+	// NextTopPosition. A project code can also outlive its project — deleting
+	// a project leaves the snapshot code on its issues — so a reused code's
+	// counter can land on a (code, number) pair a ghost row still holds.
+	// Postgres aborts the whole transaction on a failed statement, so the
+	// skip-ahead retry rolls back to a savepoint before re-allocating.
+	_, err = tx.Exec(ctx, "SAVEPOINT issue_number_attempt")
+	for attempt := 0; ; attempt++ {
+		issue, err = insertIssue(issueNumber, numberCode)
+		if err == nil {
+			_, _ = tx.Exec(ctx, "RELEASE SAVEPOINT issue_number_attempt")
+			break
+		}
 		var pgErr *pgconn.PgError
+		if attempt < 50 && errors.As(err, &pgErr) && pgErr.ConstraintName == "uq_issue_workspace_code_number" {
+			_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT issue_number_attempt")
+			issueNumber, numberCode, err = AllocateIssueNumber(ctx, qtx, p.WorkspaceID, project, issueCountPolicy)
+			if err != nil {
+				return IssueCreateResult{}, fmt.Errorf("allocate issue number: %w", err)
+			}
+			continue
+		}
 		if errors.As(err, &pgErr) && pgErr.ConstraintName == "issue_properties_size_limit" {
 			return IssueCreateResult{}, ErrIssuePropertiesTooLarge
 		}

@@ -534,7 +534,7 @@ func (group resolvedIssueTableGroup) contextExpression(addArg func(any) string, 
   SELECT jsonb_build_object('parent', jsonb_build_object(
     'id', p.id::text,
     'number', p.number,
-    'identifier', %s::text || '-' || p.number::text,
+    'identifier', %s::text || '-' || (CASE WHEN p.number_code <> '' THEN p.number_code || '-' ELSE '' END) || p.number::text,
     'title', p.title,
     'status', p.status
   ))

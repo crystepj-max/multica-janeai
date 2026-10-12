@@ -715,7 +715,24 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		return &errDispatchSkipped{reason: "recent duplicate autopilot issue: " + util.UUIDToString(duplicate.ID), code: dispatch.ReasonAlreadyActive}
 	}
 
-	issueNumber, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, issueCountPolicy)
+	var project *db.Project
+	if projectID.Valid {
+		row, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
+			ID:          projectID,
+			WorkspaceID: ap.WorkspaceID,
+		})
+		if err != nil {
+			return fmt.Errorf("load project: %w", err)
+		}
+		code, err := EnsureProjectCode(ctx, qtx, row)
+		if err != nil {
+			return fmt.Errorf("project code: %w", err)
+		}
+		row.Code = code
+		project = &row
+	}
+
+	issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, project, issueCountPolicy)
 	if err != nil {
 		var limitErr *IssueLimitReachedError
 		if errors.As(err, &limitErr) {
@@ -732,31 +749,63 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		return fmt.Errorf("get next issue position: %w", err)
 	}
 
-	issue, err := qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
-		ID:           dbid.NewV7(),
-		WorkspaceID:  ap.WorkspaceID,
-		Title:        title,
-		Description:  description,
-		Status:       "todo",
-		Priority:     "none",
-		AssigneeType: pgtype.Text{String: ap.AssigneeType, Valid: true},
-		AssigneeID:   ap.AssigneeID,
-		// The agent that the autopilot dispatches to is the issue's creator,
-		// not the human who originally configured the autopilot. The latter
-		// is captured separately via origin_type=autopilot + origin_id. For
-		// squad-assigned autopilots, the creator is the resolved leader —
-		// the same agent the issue listener will end up enqueueing.
-		CreatorType:   "agent",
-		CreatorID:     leader.ID,
-		ParentIssueID: pgtype.UUID{},
-		Position:      newPosition,
-		StartDate:     pgtype.Date{},
-		DueDate:       pgtype.Date{},
-		Number:        issueNumber,
-		ProjectID:     projectID,
-		OriginType:    pgtype.Text{String: "autopilot", Valid: true},
-		OriginID:      ap.ID,
-	})
+	// Same ghost-snapshot retry as the service Create path: a reused project
+	// code whose old issues still hold (code, number) pairs skips ahead.
+	insertDispatchIssue := func(number int32, numberCode string) (db.Issue, error) {
+		return qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
+			ID:           dbid.NewV7(),
+			WorkspaceID:  ap.WorkspaceID,
+			Title:        title,
+			Description:  description,
+			Status:       "todo",
+			Priority:     "none",
+			AssigneeType: pgtype.Text{String: ap.AssigneeType, Valid: true},
+			AssigneeID:   ap.AssigneeID,
+			// The agent that the autopilot dispatches to is the issue's creator,
+			// not the human who originally configured the autopilot. The latter
+			// is captured separately via origin_type=autopilot + origin_id. For
+			// squad-assigned autopilots, the creator is the resolved leader —
+			// the same agent the issue listener will end up enqueueing.
+			CreatorType:   "agent",
+			CreatorID:     leader.ID,
+			ParentIssueID: pgtype.UUID{},
+			Position:      newPosition,
+			StartDate:     pgtype.Date{},
+			DueDate:       pgtype.Date{},
+			Number:        number,
+			ProjectID:     projectID,
+			NumberCode:    numberCode,
+			OriginType:    pgtype.Text{String: "autopilot", Valid: true},
+			OriginID:      ap.ID,
+		})
+	}
+	// Ghost-snapshot skip-ahead under a savepoint — same as the service
+	// Create path: a failed insert aborts the transaction, so the retry must
+	// roll back to the savepoint before re-allocating.
+	_, serr := tx.Exec(ctx, "SAVEPOINT issue_number_attempt")
+	issue, err := insertDispatchIssue(issueNumber, numberCode)
+	for attempt := 0; err != nil && attempt < 50; attempt++ {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "uq_issue_workspace_code_number" {
+			break
+		}
+		_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT issue_number_attempt")
+		issueNumber, numberCode, err = AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, project, issueCountPolicy)
+		if err != nil {
+			var limitErr *IssueLimitReachedError
+			if errors.As(err, &limitErr) {
+				return &errDispatchSkipped{
+					reason: "workspace has reached its issue limit",
+					code:   dispatch.ReasonIssueLimitReached,
+				}
+			}
+			return fmt.Errorf("allocate issue number: %w", err)
+		}
+		issue, err = insertDispatchIssue(issueNumber, numberCode)
+	}
+	if serr == nil {
+		_, _ = tx.Exec(ctx, "RELEASE SAVEPOINT issue_number_attempt")
+	}
 	if err != nil {
 		return fmt.Errorf("create issue: %w", err)
 	}

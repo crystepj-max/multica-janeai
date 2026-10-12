@@ -406,6 +406,25 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
               </PopoverContent>
             </Popover>
           </PropRow>
+          <PropRow label={t(($) => $.detail.prop_code)}>
+            <input
+              key={`code-${projectId}-${project.code}`}
+              defaultValue={project.code}
+              maxLength={10}
+              spellCheck={false}
+              aria-label={t(($) => $.detail.prop_code)}
+              title={t(($) => $.detail.code_tooltip)}
+              className="w-24 rounded border-none bg-transparent px-1 py-0.5 font-mono text-caption uppercase tracking-wide hover:bg-accent/50 focus:bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+              onBlur={(e) => {
+                const next = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10);
+                e.target.value = next;
+                if (next !== "" && next !== project.code) handleUpdateField({ code: next });
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+            />
+          </PropRow>
           <PropRow label={t(($) => $.detail.prop_start_date)}>
             <ProjectStartDatePicker startDate={project.start_date} onUpdate={handleUpdateField} />
           </PropRow>

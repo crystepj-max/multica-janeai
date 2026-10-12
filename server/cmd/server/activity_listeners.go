@@ -437,5 +437,5 @@ func lookupIssueIdentifier(ctx context.Context, queries *db.Queries, workspaceID
 	if err != nil {
 		return "", false
 	}
-	return service.IssueIdentifier(ws.IssuePrefix, row.Number), true
+	return service.IssueIdentifier(ws.IssuePrefix, row.NumberCode, row.Number), true
 }

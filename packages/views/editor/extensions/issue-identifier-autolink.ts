@@ -52,8 +52,9 @@ export interface IssueIdentifierAutolinkOptions {
 }
 
 // Boundary-delimited, case-sensitive identifier — same shape as the readonly
-// detector in @multica/ui/markdown.
-const IDENTIFIER_RE = /(?<![A-Za-z0-9_-])([A-Z][A-Z0-9]*-\d+)(?![A-Za-z0-9_-])/g;
+// detector in @multica/ui/markdown, including the optional project-code middle
+// segment of project-numbered identifiers (`MUL-APP-7`).
+const IDENTIFIER_RE = /(?<![A-Za-z0-9_-])([A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)?-\d+)(?![A-Za-z0-9_-])/g;
 const BOUNDARY_RE = /[A-Za-z0-9_-]/;
 
 // Set on our own replacement transactions with the list of pending keys they

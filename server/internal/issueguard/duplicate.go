@@ -34,9 +34,13 @@ func (e *ActiveDuplicateError) Error() string {
 }
 
 func NewActiveDuplicateError(issue db.Issue, issuePrefix string) *ActiveDuplicateError {
+	identifier := fmt.Sprintf("%s-%d", issuePrefix, issue.Number)
+	if issue.NumberCode != "" {
+		identifier = fmt.Sprintf("%s-%s-%d", issuePrefix, issue.NumberCode, issue.Number)
+	}
 	return &ActiveDuplicateError{
 		ID:         util.UUIDToString(issue.ID),
-		Identifier: fmt.Sprintf("%s-%d", issuePrefix, issue.Number),
+		Identifier: identifier,
 		Title:      issue.Title,
 		Status:     issue.Status,
 	}

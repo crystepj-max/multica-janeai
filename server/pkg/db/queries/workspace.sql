@@ -62,6 +62,13 @@ UPDATE workspace SET issue_counter = issue_counter + 1
 WHERE id = $1
 RETURNING issue_counter;
 
+-- name: LockWorkspaceForIssueCreate :one
+-- Serializes issue creation on the workspace row. The workspace-numbered
+-- branch holds this lock implicitly through IncrementIssueCounter's UPDATE;
+-- project-numbered creates take it explicitly so
+-- issueposition.NextTopPosition keeps its create-vs-create guarantee.
+SELECT id FROM workspace WHERE id = $1 FOR UPDATE;
+
 -- name: LockWorkspaceForDelete :one
 -- Taken first by DeleteWorkspace, before it enumerates the workspace's chat
 -- sessions. LockChatSessionsByWorkspace only covers sessions that exist when it

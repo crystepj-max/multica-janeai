@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -328,7 +327,7 @@ func highestClosedBatchStage(children, completed []db.Issue, isTerminal func(db.
 // set that transitioned to terminal in this batch; it is nil for single updates.
 func (h *Handler) postChildDoneComment(ctx context.Context, parent, completed db.Issue, children []db.Issue, staged bool, closedStage int32, batch bool, statuses resolvedChildStatuses, batchCompleted []db.Issue) {
 	prefix := h.getIssuePrefix(ctx, completed.WorkspaceID)
-	identifier := prefix + "-" + strconv.Itoa(int(completed.Number))
+	identifier := service.IssueIdentifier(prefix, completed.NumberCode, completed.Number)
 	childID := uuidToString(completed.ID)
 	title := sanitizeChildTitleForSystemComment(completed.Title)
 	parentID := uuidToString(parent.ID)

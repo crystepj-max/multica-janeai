@@ -433,6 +433,21 @@ func (q *Queries) LockWorkspaceForDelete(ctx context.Context, id pgtype.UUID) (p
 	return id_2, err
 }
 
+const lockWorkspaceForIssueCreate = `-- name: LockWorkspaceForIssueCreate :one
+SELECT id FROM workspace WHERE id = $1 FOR UPDATE
+`
+
+// Serializes issue creation on the workspace row. The workspace-numbered
+// branch holds this lock implicitly through IncrementIssueCounter's UPDATE;
+// project-numbered creates take it explicitly so
+// issueposition.NextTopPosition keeps its create-vs-create guarantee.
+func (q *Queries) LockWorkspaceForIssueCreate(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockWorkspaceForIssueCreate, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const updateWorkspace = `-- name: UpdateWorkspace :one
 UPDATE workspace SET
     name = COALESCE($2, name),

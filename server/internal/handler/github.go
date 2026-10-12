@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -974,7 +975,7 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "failed to list pull requests")
 		return
 	}
-	identifier := fmt.Sprintf("%s-%d", issuePrefixForWorkspace(ws), issue.Number)
+	identifier := service.IssueIdentifier(issuePrefixForWorkspace(ws), issue.NumberCode, issue.Number)
 	rows, err := h.Queries.ListPullRequestsByIssue(r.Context(), issue.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list pull requests")
@@ -1023,7 +1024,7 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"pull_requests": out,
-		"auto_complete": prAutoCompleteToResponse(ws, decision),
+		"auto_complete": prAutoCompleteToResponse(decision),
 	})
 }
 
@@ -1052,22 +1053,22 @@ func (h *Handler) broadcastPRSnapshotApplied(ctx context.Context, prID pgtype.UU
 
 // ── Webhook ─────────────────────────────────────────────────────────────────
 
-// identifierRe extracts identifiers like "MUL-1510" from text. Case-insensitive
-// because branch names are conventionally lowercase but issue prefixes are
-// uppercase. Word boundary on the left prevents matching inside email-style
-// strings (e.g. "abc@MUL-1") and the digit anchor on the right rules out
-// version numbers like "v1.2-3".
-var identifierRe = regexp.MustCompile(`(?i)\b([a-z][a-z0-9]{0,9})-(\d+)\b`)
+// identifierRe extracts identifiers like "MUL-1510" or "MUL-APP-7" from text.
+// Case-insensitive because branch names are conventionally lowercase but issue
+// prefixes are uppercase. Word boundary on the left prevents matching inside
+// email-style strings (e.g. "abc@MUL-1") and the digit anchor on the right
+// rules out version numbers like "v1.2-3".
+var identifierRe = regexp.MustCompile(`(?i)\b([a-z][a-z0-9]{0,9})(?:-([a-z0-9]{1,10}))?-(\d+)\b`)
 
 // closingIdentifierRe extracts identifiers that appear immediately after a
 // GitHub-style closing keyword ("close[sd]?", "fix(e[sd])?", "resolve[sd]?"),
 // optionally separated by a colon and whitespace. Matching is intentionally
-// strict on adjacency — "Fix MUL-1" closes MUL-1, but "Fix login MUL-1" does
-// not. A closing keyword is what lets a merged PR complete its issue; a bare
-// title prefix like "MUL-1: ..." or a branch reference links the PR but never
-// completes the issue on its own.
+// strict on adjacency — "Fix MUL-1" names MUL-1, but "Fix login MUL-1" does
+// not. It is the one way a PR body links an issue; a bare body mention links
+// nothing. Since MUL-7726 the keyword only links: what a merge does is the
+// workspace's choice, not the PR text's.
 var closingIdentifierRe = regexp.MustCompile(
-	`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[:\s]+([a-z][a-z0-9]{0,9})-(\d+)\b`,
+	`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[:\s]+([a-z][a-z0-9]{0,9})(?:-([a-z0-9]{1,10}))?-(\d+)\b`,
 )
 
 // HandleGitHubWebhook (POST /api/webhooks/github) is GitHub's destination for
@@ -1344,9 +1345,6 @@ type prLinkPolicy struct {
 	// ambiguous lists identifiers that resolved in more than one auto-linking
 	// workspace.
 	ambiguous map[string]bool
-	// sole maps an identifier to the workspace proven to be the only bound one
-	// resolving it, auto-link on or off (see permitsClose).
-	sole map[string]string
 }
 
 // permits reports whether workspaceID may link identifier.
@@ -1358,35 +1356,17 @@ func (c prLinkPolicy) permits(identifier, workspaceID string) bool {
 	return ok && owner == workspaceID
 }
 
-// permitsClose reports whether workspaceID may act on a closing keyword for
-// identifier on the links it already has. Auto-link decides which links get
-// created, not whether their keywords count, so a workspace that turned it off
-// still acts when no other bound workspace resolves the identifier. The
-// auto-linking owner acts too: another resolver with auto-link off holds only
-// links a person added, and does not act.
-func (c prLinkPolicy) permitsClose(identifier, workspaceID string) bool {
-	if c.unrestricted {
-		return true
-	}
-	if owner, ok := c.owner[identifier]; ok && owner == workspaceID {
-		return true
-	}
-	sole, ok := c.sole[identifier]
-	return ok && sole == workspaceID
-}
-
 // resolvePRLinkPolicy determines, before any workspace writes, which claimed
-// identifiers on this PR may link, or carry close intent, and in which
-// workspace. An identifier is allowed only when exactly one bound workspace
-// was proven to resolve it (see permits and permitsClose for which count);
-// misjudging "unique" as "ambiguous" costs a link a person can add by hand,
-// while the reverse would complete someone else's issue.
+// identifiers on this PR may link, and in which workspace. An identifier is
+// allowed only when exactly one auto-linking bound workspace was proven to
+// resolve it; misjudging "unique" as "ambiguous" costs a link a person can add
+// by hand, while the reverse would move someone else's issue on merge.
 func (h *Handler) resolvePRLinkPolicy(ctx context.Context, insts []db.GithubInstallation, p *ghPullRequestPayload) prLinkPolicy {
 	if len(insts) < 2 {
 		return prLinkPolicy{unrestricted: true}
 	}
-	idents, _ := prClaimedIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)
-	policy := prLinkPolicy{owner: map[string]string{}, ambiguous: map[string]bool{}, sole: map[string]string{}}
+	idents := prClaimedIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)
+	policy := prLinkPolicy{owner: map[string]string{}, ambiguous: map[string]bool{}}
 	if len(idents) == 0 {
 		return policy
 	}
@@ -1420,27 +1400,38 @@ func (h *Handler) resolvePRLinkPolicy(ctx context.Context, insts []db.GithubInst
 		}
 		prefix := issuePrefixForWorkspace(ws)
 		for _, id := range idents {
-			number, ok := issueNumberForPrefix(id, prefix)
+			code, number, ok := issueNumberForPrefix(id, prefix)
 			if !ok {
 				continue
 			}
-			if _, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
-				WorkspaceID: inst.WorkspaceID,
-				Number:      number,
-			}); err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					continue
+			if code != "" {
+				if _, err := h.Queries.GetIssueByNumberCode(ctx, db.GetIssueByNumberCodeParams{
+					WorkspaceID: inst.WorkspaceID,
+					NumberCode:  code,
+					Number:      number,
+				}); err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						continue
+					}
+					return indeterminate("github: cannot resolve identifier in bound workspace, leaving links unchanged for this delivery",
+						"err", err, "identifier", id, "workspace_id", uuidToString(inst.WorkspaceID))
 				}
-				return indeterminate("github: cannot resolve identifier in bound workspace, leaving links unchanged for this delivery",
-					"err", err, "identifier", id, "workspace_id", uuidToString(inst.WorkspaceID))
+			} else {
+				if _, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
+					WorkspaceID: inst.WorkspaceID,
+					Number:      number,
+				}); err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						continue
+					}
+					return indeterminate("github: cannot resolve identifier in bound workspace, leaving links unchanged for this delivery",
+						"err", err, "identifier", id, "workspace_id", uuidToString(inst.WorkspaceID))
+				}
 			}
 			resolvers[id] = append(resolvers[id], resolver{workspaceID: uuidToString(inst.WorkspaceID), autoLink: autoLink})
 		}
 	}
 	for id, all := range resolvers {
-		if len(all) == 1 {
-			policy.sole[id] = all[0].workspaceID
-		}
 		// A workspace with auto-link off never writes a link row, so it is not
 		// a competing claimant for the link.
 		var wss []string
@@ -1624,7 +1615,7 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 	ws, err := h.Queries.GetWorkspace(ctx, wsID)
 	if err == nil && githubFeaturesEnabled(ws) && !linkPolicy.indeterminate {
 		touched := map[pgtype.UUID]struct{}{}
-		idents, closing := prClaimedIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)
+		idents := prClaimedIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)
 		if autoLink, _ := autoLinkPRsEnabledForWorkspace(ws); autoLink {
 			linkedIssueIDs, touched = h.reconcileAutoLinks(ctx, ws, pr.ID, state, prAutoLinkInput{
 				idents:    idents,
@@ -1640,18 +1631,6 @@ func (h *Handler) mirrorPullRequestForWorkspace(ctx context.Context, wsID pgtype
 					return h.Queries.ListAutoLinkedIssueIDsForPullRequest(ctx, pr.ID)
 				},
 			})
-		}
-		// Close intent is read from the PR text whether or not auto-link is on:
-		// the flag decides which links get created, not whether an existing
-		// link's keyword still stands. The merge/close event itself still
-		// records the text; later edits of a merged or closed PR do not.
-		if p.Action == "closed" || (state != "merged" && state != "closed") {
-			if err := h.Queries.SyncPullRequestCloseIntent(ctx, db.SyncPullRequestCloseIntentParams{
-				PullRequestID:   pr.ID,
-				ClosingIssueIds: h.closingIssueIDs(ctx, ws, closing, func(id string) bool { return linkPolicy.permitsClose(id, workspaceID) }),
-			}); err != nil {
-				slog.Warn("github: sync close intent failed", "err", err)
-			}
 		}
 		// A merge is a PR event for every issue this PR is linked to, manual
 		// links included.
@@ -1702,8 +1681,7 @@ type prAutoLinkInput struct {
 //   - An automatic link for an identifier that turned out to be ambiguous
 //     across bound workspaces is always dropped (see prLinkPolicy).
 //
-// Manual links are never touched here, and close intent is not either (see
-// closingIssueIDs).
+// Manual links are never touched here.
 func (h *Handler) reconcileAutoLinks(ctx context.Context, ws db.Workspace, prID pgtype.UUID, state string, in prAutoLinkInput) ([]string, map[pgtype.UUID]struct{}) {
 	touched := map[pgtype.UUID]struct{}{}
 	linked := make([]string, 0)
@@ -1766,27 +1744,6 @@ func (h *Handler) reconcileAutoLinks(ctx context.Context, ws db.Workspace, prID 
 		}
 	}
 	return linked, touched
-}
-
-// closingIssueIDs resolves the identifiers a PR closes with a keyword to this
-// workspace's issues, for the PR-wide close_intent sync: every link of the PR,
-// automatic or manual, gets close intent exactly when its issue is in this
-// list, so a keyword removed from the text stops counting. It honors the
-// delivery's cross-workspace verdict (permitsClose on GitHub). Close intent
-// only decides anything once the PR merges — a PR event of its own — so the
-// sync is not one. Never nil: an empty list clears every link's close intent.
-func (h *Handler) closingIssueIDs(ctx context.Context, ws db.Workspace, closing []string, permits func(string) bool) []pgtype.UUID {
-	ids := make([]pgtype.UUID, 0, len(closing))
-	prefix := issuePrefixForWorkspace(ws)
-	for _, id := range closing {
-		if !permits(id) {
-			continue
-		}
-		if issue, ok := h.lookupIssueByIdentifier(ctx, ws.ID, prefix, id); ok {
-			ids = append(ids, issue.ID)
-		}
-	}
-	return ids
 }
 
 // derivePRMergeableState resolves the upsert behaviour for the PR row's
@@ -1875,8 +1832,8 @@ func extractIdentifiers(parts ...string) []string {
 }
 
 // extractClosingIdentifiers pulls every identifier that appears immediately
-// after a closing keyword. Callers pass the title and body only: a branch name
-// is not natural language, so "fix/mul-1-login" is a reference, not a close.
+// after a closing keyword. Callers pass the title and body only: in a branch
+// name any identifier links already.
 func extractClosingIdentifiers(parts ...string) []string {
 	return extractMatchedIdentifiers(closingIdentifierRe, parts...)
 }
@@ -1886,7 +1843,16 @@ func extractMatchedIdentifiers(re *regexp.Regexp, parts ...string) []string {
 	out := []string{}
 	for _, src := range parts {
 		for _, m := range re.FindAllStringSubmatch(src, -1) {
-			ident := strings.ToUpper(m[1]) + "-" + m[2]
+			// Rebuild from capture groups — closingIdentifierRe's match
+			// includes the leading keyword, and the middle project-code group
+			// is optional, so the segments are joined from whatever matched.
+			segments := make([]string, 0, 3)
+			for _, seg := range m[1:] {
+				if seg != "" {
+					segments = append(segments, strings.ToUpper(seg))
+				}
+			}
+			ident := strings.Join(segments, "-")
 			if _, dup := seen[ident]; dup {
 				continue
 			}
@@ -1897,19 +1863,17 @@ func extractMatchedIdentifiers(re *regexp.Regexp, parts ...string) []string {
 	return out
 }
 
-// prClaimedIdentifiers returns the identifiers a PR claims, and which of them
-// it closes. The title and branch name link an issue; a closing keyword in the
-// title or body ("Closes MUL-1") links it too and marks the PR as the one that
-// completes it. A bare mention in the body claims nothing.
-func prClaimedIdentifiers(title, body, branch string) (idents, closing []string) {
-	idents = extractIdentifiers(title, branch)
-	closing = extractClosingIdentifiers(title, body)
-	for _, id := range closing {
+// prClaimedIdentifiers returns the identifiers a PR claims. The title and
+// branch name link an issue, and so does a closing keyword in the body
+// ("Closes MUL-1"). A bare mention in the body claims nothing.
+func prClaimedIdentifiers(title, body, branch string) []string {
+	idents := extractIdentifiers(title, branch)
+	for _, id := range extractClosingIdentifiers(title, body) {
 		if !slices.Contains(idents, id) {
 			idents = append(idents, id)
 		}
 	}
-	return idents, closing
+	return idents
 }
 
 // autoLinkPRsEnabledForWorkspace reports whether the workspace allows the
@@ -1956,33 +1920,54 @@ func githubFeaturesEnabled(ws db.Workspace) bool {
 	return s.GitHubEnabled == nil || *s.GitHubEnabled
 }
 
-// issueNumberForPrefix returns the issue number encoded in a "PREFIX-NUMBER"
-// identifier, and false when the identifier is malformed or carries a prefix
-// that is not the workspace's. Case-insensitive: branch names are
-// conventionally lowercase while issue prefixes are uppercase.
-func issueNumberForPrefix(identifier, prefix string) (int32, bool) {
+// issueNumberForPrefix returns the issue number — and, for a three-part
+// identifier, the project-code segment — encoded in "PREFIX-NUMBER" or
+// "PREFIX-CODE-NUMBER". ok is false when the identifier is malformed or
+// carries a prefix that is not the workspace's. Case-insensitive: branch
+// names are conventionally lowercase while issue prefixes are uppercase. The
+// returned code is empty for the two-part form.
+func issueNumberForPrefix(identifier, prefix string) (string, int32, bool) {
 	idx := strings.LastIndex(identifier, "-")
 	if idx < 0 {
-		return 0, false
+		return "", 0, false
 	}
-	gotPrefix, numStr := identifier[:idx], identifier[idx+1:]
-	if !strings.EqualFold(gotPrefix, prefix) {
-		return 0, false
+	gotNumber, numStr := identifier[:idx], identifier[idx+1:]
+	code := ""
+	if cIdx := strings.LastIndex(gotNumber, "-"); cIdx >= 0 {
+		code = strings.ToUpper(gotNumber[cIdx+1:])
+		gotNumber = gotNumber[:cIdx]
+	}
+	if !strings.EqualFold(gotNumber, prefix) {
+		return "", 0, false
 	}
 	n, err := strconv.Atoi(numStr)
 	if err != nil {
-		return 0, false
+		return "", 0, false
 	}
-	return int32(n), true
+	return code, int32(n), true
 }
 
 // lookupIssueByIdentifier looks up an issue in the given workspace by its
-// "PREFIX-NUMBER" identifier. Returns the row + true if the prefix matches
-// the workspace's configured prefix and the number resolves to a real issue.
+// "PREFIX-NUMBER" or "PREFIX-CODE-NUMBER" identifier. Returns the row + true
+// if the prefix matches the workspace's configured prefix and the number
+// resolves to a real issue. The three-part form matches the issue's
+// creation-time code snapshot; the two-part form only matches
+// workspace-numbered issues.
 func (h *Handler) lookupIssueByIdentifier(ctx context.Context, workspaceID pgtype.UUID, prefix, identifier string) (db.Issue, bool) {
-	number, ok := issueNumberForPrefix(identifier, prefix)
+	code, number, ok := issueNumberForPrefix(identifier, prefix)
 	if !ok {
 		return db.Issue{}, false
+	}
+	if code != "" {
+		issue, err := h.Queries.GetIssueByNumberCode(ctx, db.GetIssueByNumberCodeParams{
+			WorkspaceID: workspaceID,
+			NumberCode:  code,
+			Number:      number,
+		})
+		if err != nil {
+			return db.Issue{}, false
+		}
+		return issue, true
 	}
 	issue, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
 		WorkspaceID: workspaceID,

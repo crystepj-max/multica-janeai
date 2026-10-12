@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -75,8 +76,8 @@ type IssueResponse struct {
 	ProjectID   *string           `json:"project_id"`
 	Position    float64           `json:"position"`
 	// Stage groups sub-issues under the same parent into ordered barrier
-	// groups (null = unstaged). See issue_child_done.go for how a closed
-	// stage gates the child-done -> parent wake.
+	// groups (null = unstaged). See service/issue_wakeup_system.go for how a
+	// closed stage wakes the parent's assignee.
 	Stage     *int32  `json:"stage"`
 	StartDate *string `json:"start_date"`
 	DueDate   *string `json:"due_date"`
@@ -464,19 +465,24 @@ func (h *Handler) fillDuplicateOf(ctx context.Context, wsID pgtype.UUID, resp *I
 	if row == nil {
 		return
 	}
-	// The response already rendered its own identifier with the workspace
-	// prefix; the original shares it.
-	prefix := strings.TrimSuffix(resp.Identifier, "-"+strconv.Itoa(int(resp.Number)))
+	// The workspace prefix is this response's own first identifier segment;
+	// the original renders with the same prefix but its own creation-time
+	// code snapshot (the two may live in different projects). A degraded
+	// "#42" identifier has no dash, meaning no prefix either.
+	prefix, _, hasDash := strings.Cut(resp.Identifier, "-")
+	if !hasDash {
+		prefix = ""
+	}
 	resp.DuplicateOf = &IssueRefResponse{
 		ID:         uuidToString(row.ID),
-		Identifier: prefix + "-" + strconv.Itoa(int(row.Number)),
+		Identifier: service.IssueIdentifier(prefix, row.NumberCode, row.Number),
 		Title:      row.Title,
 		Status:     row.Status,
 	}
 }
 
 func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
-	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	identifier := service.IssueIdentifier(issuePrefix, i.NumberCode, i.Number)
 	// Built-ins map to public categories without a catalog lookup. A custom
 	// status is filled by endpoints that resolve the workspace catalog.
 	statusCategory := ""
@@ -520,7 +526,7 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 	if issuestatus.IsBuiltIn(i.Status) {
 		statusCategory = i.Status
 	}
-	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	identifier := service.IssueIdentifier(issuePrefix, i.NumberCode, i.Number)
 	return IssueResponse{
 		ID:                 uuidToString(i.ID),
 		WorkspaceID:        uuidToString(i.WorkspaceID),
@@ -590,7 +596,7 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 	if issuestatus.IsBuiltIn(i.Status) {
 		statusCategory = i.Status
 	}
-	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	identifier := service.IssueIdentifier(issuePrefix, i.NumberCode, i.Number)
 	return IssueResponse{
 		ID:                 uuidToString(i.ID),
 		WorkspaceID:        uuidToString(i.WorkspaceID),
@@ -774,21 +780,39 @@ func splitSearchTerms(q string) []string {
 	return terms
 }
 
-// identifierNumberRe matches patterns like "MUL-123" or "ABC-45".
-var identifierNumberRe = regexp.MustCompile(`(?i)^[a-z]+-(\d+)$`)
+// identifierNumberRe matches patterns like "MUL-123", "V2-12", "MUL-APP-7", or
+// "ABC-45" (the optional middle segment is a project code).
+var identifierNumberRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9]*(?:-[a-z0-9]{1,10})?-(\d+)$`)
+
+// identifierCodeRe matches three-part identifiers ("MUL-APP-7") and captures
+// the project-code middle segment.
+var identifierCodeRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9]*-([a-z0-9]{1,10})-(\d+)$`)
+
+// identifierQueryCode returns the project-code segment of a three-part
+// identifier query ("MUL-APP-7" → "APP"), or "" for two-part identifiers and
+// bare numbers.
+func identifierQueryCode(q string) string {
+	if m := identifierCodeRe.FindStringSubmatch(strings.TrimSpace(q)); m != nil {
+		return strings.ToUpper(m[1])
+	}
+	return ""
+}
 
 // parseQueryNumber extracts an issue number from the query if it looks like
-// an identifier (e.g. "MUL-123") or a bare number (e.g. "123").
+// an identifier (e.g. "MUL-123" or "V2-12") or a bare number (e.g. "123").
+// Numbers above int32 are rejected — the column is int4, and a
+// timestamp-shaped title tail ("report-1791726067515281000") would otherwise
+// bind an out-of-range param.
 func parseQueryNumber(q string) (int, bool) {
 	q = strings.TrimSpace(q)
 	// Check for identifier pattern like "MUL-123"
 	if m := identifierNumberRe.FindStringSubmatch(q); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 && n <= math.MaxInt32 {
 			return n, true
 		}
 	}
 	// Check for bare number
-	if n, err := strconv.Atoi(q); err == nil && n > 0 {
+	if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= math.MaxInt32 {
 		return n, true
 	}
 	return 0, false
@@ -836,6 +860,19 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	if hasNum {
 		numParam = nextArg(queryNum)
 	}
+	// Scope the number match to the numbering sequence the query names: a
+	// three-part identifier ("MUL-APP-7") targets that project's sequence,
+	// while a two-part identifier or a bare number only ever targets the
+	// workspace-numbered sequence.
+	numberExactExpr := ""
+	if hasNum {
+		if code := identifierQueryCode(phrase); code != "" {
+			codeParam := nextArg(code)
+			numberExactExpr = fmt.Sprintf("(i.number = %s AND i.number_code = %s)", numParam, codeParam)
+		} else {
+			numberExactExpr = fmt.Sprintf("(i.number = %s AND i.number_code = '')", numParam)
+		}
+	}
 
 	terminalStatusesParam := ""
 	if !includeClosed {
@@ -876,7 +913,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 		fmt.Sprintf("COALESCE(%s LIKE %s, FALSE) AS description_phrase", loweredIssueDescription, phraseContainsParam),
 	}
 	if hasNum {
-		issueFlagColumns = append(issueFlagColumns, fmt.Sprintf("i.number = %s AS number_exact", numParam))
+		issueFlagColumns = append(issueFlagColumns, fmt.Sprintf("%s AS number_exact", numberExactExpr))
 	}
 	for index, termParam := range termContainsParams {
 		issueFlagColumns = append(issueFlagColumns,
@@ -1099,7 +1136,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
 		i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position,
-		i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id,
+		i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.number_code, i.project_id,
 		i.revision, i.duplicate_of_issue_id,
 		pc.match_source,
 		COALESCE(c.content, '') AS matched_comment_content
@@ -1194,6 +1231,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 				&sr.issue.UpdatedAt,
 				&sr.issue.LastActivityAt,
 				&sr.issue.Number,
+				&sr.issue.NumberCode,
 				&sr.issue.ProjectID,
 				&sr.issue.Revision,
 				&sr.issue.DuplicateOfIssueID,
@@ -1749,7 +1787,7 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 
 	query := fmt.Sprintf(`SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id, i.metadata, i.stage, i.properties,
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.number_code, i.project_id, i.metadata, i.stage, i.properties,
 	   i.revision, i.duplicate_of_issue_id
 FROM issue i
 WHERE %s
@@ -1786,6 +1824,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 			&row.UpdatedAt,
 			&row.LastActivityAt,
 			&row.Number,
+			&row.NumberCode,
 			&row.ProjectID,
 			&row.Metadata,
 			&row.Stage,
@@ -1928,7 +1967,14 @@ func appendIssueTableSearchFilter(where []string, addArg func(any) string, raw s
 		ors = append(ors, "("+strings.Join(titleMatches, " AND ")+")")
 	}
 	if number, ok := parseQueryNumber(query); ok {
-		ors = append(ors, fmt.Sprintf("i.number = %s", addArg(number)))
+		// Scope the number match to the sequence the query names, mirroring
+		// buildSearchQuery: a three-part identifier targets that project's
+		// sequence, everything else only the workspace-numbered one.
+		if code := identifierQueryCode(query); code != "" {
+			ors = append(ors, fmt.Sprintf("(i.number = %s AND i.number_code = %s)", addArg(number), addArg(code)))
+		} else {
+			ors = append(ors, fmt.Sprintf("(i.number = %s AND i.number_code = '')", addArg(number)))
+		}
 	}
 	if len(ors) == 0 {
 		return where
@@ -2350,7 +2396,7 @@ WITH ranked AS (
 		i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
 		i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at,
-		i.number, i.project_id, i.metadata, i.stage, i.properties, i.revision, i.duplicate_of_issue_id,
+		i.number, i.number_code, i.project_id, i.metadata, i.stage, i.properties, i.revision, i.duplicate_of_issue_id,
 		COUNT(*) OVER (PARTITION BY i.assignee_type, i.assignee_id) AS group_total,
 		ROW_NUMBER() OVER (
 			PARTITION BY i.assignee_type, i.assignee_id
@@ -2363,7 +2409,7 @@ SELECT
 	id, workspace_id, title, description, status, priority,
 	assignee_type, assignee_id, creator_type, creator_id,
 	parent_issue_id, position, start_date, due_date, created_at, updated_at, last_activity_at,
-	number, project_id, metadata, stage, properties, revision, duplicate_of_issue_id, group_total
+	number, number_code, project_id, metadata, stage, properties, revision, duplicate_of_issue_id, group_total
 FROM ranked
 WHERE rn > %s AND rn <= %s + %s
 ORDER BY
@@ -2407,6 +2453,7 @@ ORDER BY
 			&row.UpdatedAt,
 			&row.LastActivityAt,
 			&row.Number,
+			&row.NumberCode,
 			&row.ProjectID,
 			&row.Metadata,
 			&row.Stage,
@@ -3478,7 +3525,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		slog.Warn("create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
-		writeError(w, http.StatusInternalServerError, "failed to create issue: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to create issue")
 		return
 	}
 
@@ -3994,7 +4041,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		slog.Warn("update issue failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
-		writeError(w, http.StatusInternalServerError, "failed to update issue: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to update issue")
 		return
 	}
 
@@ -4088,13 +4135,11 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.HandoffNote)
 	}
 
-	// Platform-driven parent notification: when this issue transitions into
-	// `done` and has a parent, post a top-level system comment on the parent
-	// (MUL-2538 — replaces the agent-prompt rule that caused self-mention
-	// loops in PR #2918). The helper guards on transition + parent state and
-	// fails best-effort.
-	if statusChanged {
-		h.notifyParentOfChildDone(r.Context(), prevIssue, issue)
+	// Sub-issue rules on the parent (the child_done system rule and sub-issue
+	// conditions): the write recorded the change; process it now. A failure
+	// is retried by the scheduler sweep.
+	if statusChanged || prevIssue.ParentIssueID != issue.ParentIssueID || prevIssue.Stage != issue.Stage {
+		h.processChildEvents(r.Context(), issue.ParentIssueID, prevIssue.ParentIssueID)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -4470,7 +4515,7 @@ func (h *Handler) publishClearedDuplicates(ctx context.Context, cleared []cleare
 			"issue":                        response,
 			"duplicate_of_issue_id":        liveDuplicateMark(c.Issue.Status, c.Issue.DuplicateOfIssueID),
 			"prev_duplicate_of_issue_id":   liveDuplicateMark(c.Issue.Status, c.Original.ID),
-			"prev_duplicate_of_identifier": prefix + "-" + strconv.Itoa(int(c.Original.Number)),
+			"prev_duplicate_of_identifier": service.IssueIdentifier(prefix, c.Original.NumberCode, c.Original.Number),
 		})
 	}
 }
@@ -4599,10 +4644,10 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	// One Resolver for the whole batch — a per-issue filler would query the
 	// catalog once per custom-status row. (MUL-6243)
 	fillBatch := h.newStatusCategoryFiller(r.Context(), wsUUID)
-	// Children that transitioned into a terminal status this batch, collected so
-	// the parent/stage notification is evaluated once against the final state
-	// after the loop (MUL-4155) rather than per-child mid-batch.
-	var childDoneCompleted []db.Issue
+	// Parents whose sub-issues changed this batch. Their rules are evaluated
+	// once after the loop against the final state (MUL-4155), not per child
+	// against a mid-batch snapshot.
+	var changedParents []pgtype.UUID
 	for _, issueID := range req.IssueIDs {
 		issueUUID, err := util.ParseUUID(issueID)
 		if err != nil {
@@ -4823,37 +4868,18 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		// No status change — not even → cancelled — cancels active tasks here,
 		// mirroring UpdateIssue (MUL-4465). See that handler for the rationale.
 
-		// Platform-driven parent notification, mirrored from UpdateIssue
-		// (MUL-2538) but DEFERRED to after the loop. Evaluating the stage
-		// barrier here, per-child, would read a mid-batch sibling snapshot and
-		// fire a stale "advance Stage N+1" wake when one batch closes several
-		// stages at once (MUL-4155). Collect the terminal transitions and let
-		// notifyParentsOfBatchChildDone below evaluate each parent once against
-		// the batch's final committed state. Same transition guard as
-		// notifyParentOfChildDone: a non-terminal -> terminal move on a child.
-		// Resolve both sides to the canonical status they inherit before the
-		// terminal test, so a batch that moves the last child onto a CUSTOM
-		// done/cancelled status still enters the stage barrier below. A literal
-		// comparison here left childDoneCompleted empty and silently skipped
-		// notifyParentsOfBatchChildDone entirely. (MUL-6243)
-		if statusChanged && issue.ParentIssueID.Valid {
-			prevTerminal := isTerminalChildStatus(
-				issuestatus.Effective(r.Context(), h.Queries, prevIssue.WorkspaceID, prevIssue.Status))
-			nowTerminal := isTerminalChildStatus(
-				issuestatus.Effective(r.Context(), h.Queries, issue.WorkspaceID, issue.Status))
-			if !prevTerminal && nowTerminal {
-				childDoneCompleted = append(childDoneCompleted, issue)
-			}
+		if statusChanged || prevIssue.ParentIssueID != issue.ParentIssueID || prevIssue.Stage != issue.Stage {
+			changedParents = append(changedParents, issue.ParentIssueID, prevIssue.ParentIssueID)
 		}
 
 		updated++
 	}
 
-	// Aggregate parent/stage notification over the whole batch's final state so
-	// each affected parent gets at most one accurate comment + wake, independent
-	// of issue_ids order (MUL-4155). Best-effort; failure does not abort the
-	// batch. Single-issue UpdateIssue is unchanged and still notifies inline.
-	h.notifyParentsOfBatchChildDone(r.Context(), childDoneCompleted)
+	// Each write recorded its sub-issue change; processing claims them per
+	// parent, so each parent is evaluated once against the batch's final
+	// state, independent of issue_ids order (MUL-4155). A failure is retried
+	// by the sweep.
+	h.processChildEvents(r.Context(), changedParents...)
 
 	slog.Info("batch update issues", append(logger.RequestAttrs(r), "count", updated)...)
 	writeJSON(w, http.StatusOK, map[string]any{"updated": updated})

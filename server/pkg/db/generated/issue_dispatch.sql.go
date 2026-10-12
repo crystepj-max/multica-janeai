@@ -38,7 +38,7 @@ func (q *Queries) GetIssueDispatchRequest(ctx context.Context, arg GetIssueDispa
 }
 
 const lockIssueForDispatch = `-- name: LockIssueForDispatch :one
-SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id, number_code FROM issue
 WHERE id = $1 AND workspace_id = $2
 FOR NO KEY UPDATE
 `
@@ -84,6 +84,7 @@ func (q *Queries) LockIssueForDispatch(ctx context.Context, arg LockIssueForDisp
 		&i.LastActivityAt,
 		&i.TriageState,
 		&i.DuplicateOfIssueID,
+		&i.NumberCode,
 	)
 	return i, err
 }

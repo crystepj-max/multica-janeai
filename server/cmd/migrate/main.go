@@ -140,6 +140,12 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // they are still pending: a fresh self-hosted install, which is exactly where an
 // interrupted build would otherwise leave a permanently unusable index.
 var concurrentIndexCleanups = map[string]string{
+	"9018_uq_issue_workspace_number_blank":                      "uq_issue_workspace_number_blank",
+	"9019_uq_issue_workspace_code_number":                       "uq_issue_workspace_code_number",
+	"9020_uq_project_workspace_code":                            "uq_project_workspace_code",
+	"563_search_index_change_changed_at_index":                  "idx_search_index_change_changed_at",
+	"562_search_index_change_workspace_index":                   "idx_search_index_change_workspace_xid",
+	"552_agent_task_history_page_index":                         "idx_agent_task_queue_history_page",
 	"535_github_pr_address_index":                               "idx_github_pull_request_pr_owner_repo",
 	"539_task_supplement_request_index":                         "task_supplement_task_request_uidx",
 	"540_task_supplement_capability_index":                      "task_supplement_capability_task_uidx",
@@ -147,6 +153,16 @@ var concurrentIndexCleanups = map[string]string{
 	"546_issue_pr_automation_workspace_index":                   "idx_issue_pr_automation_workspace",
 	"547_issue_pull_request_exclusion_workspace_index":          "idx_issue_pull_request_exclusion_workspace",
 	"548_task_supplement_comment_task_index":                    "task_supplement_comment_task_uidx",
+	"554_wakeup_expiry_index":                                   "issue_wakeup_expiry_idx",
+	"556_wakeup_system_rule_index":                              "issue_wakeup_system_rule_idx",
+	"559_issue_child_event_id":                                  "issue_child_event_id_idx",
+	"560_issue_child_event_pending":                             "issue_child_event_pending_idx",
+	"566_channel_typing_reaction_id_idx":                        "channel_typing_reaction_id_idx",
+	"567_channel_typing_reaction_retry_idx":                     "channel_typing_reaction_retry_idx",
+	"568_channel_typing_reaction_gc_idx":                        "channel_typing_reaction_gc_idx",
+	"570_channel_typing_quota_idx":                              "channel_typing_reaction_quota_idx",
+	"571_channel_typing_expiry_idx":                             "channel_typing_reaction_expiry_idx",
+	"572_channel_typing_abandoned_idx":                          "channel_typing_reaction_abandoned_idx",
 	"510_wakeup_id":                                             "issue_wakeup_id_idx",
 	"511_wakeup_issue":                                          "issue_wakeup_issue_idx",
 	"512_wakeup_due":                                            "issue_wakeup_due_idx",
@@ -341,8 +357,8 @@ var concurrentIndexCleanups = map[string]string{
 	"482_agent_task_queue_telemetry_started_index":              "idx_agent_task_queue_telemetry_started",
 	"484_issue_triage_state_index":                              "idx_issue_triage_state",
 	"537_issue_duplicate_of_index":                              "idx_issue_duplicate_of",
-	"554_issue_dispatch_request_idempotency_index":              "idx_issue_dispatch_request_workspace_key",
-	"556_issue_task_dispatch_revision_index":                    "idx_agent_task_issue_dispatch_revision",
+	"9014_issue_dispatch_request_idempotency_index":             "idx_issue_dispatch_request_workspace_key",
+	"9016_issue_task_dispatch_revision_index":                   "idx_agent_task_issue_dispatch_revision",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction

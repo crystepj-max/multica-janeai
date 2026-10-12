@@ -623,7 +623,7 @@ func TestPublishAttachmentsChangedKeepsDuplicateMark(t *testing.T) {
 			}
 			want := map[string]any{
 				"id":         originalID,
-				"identifier": IssueIdentifier(workspace.IssuePrefix, original.Number),
+				"identifier": IssueIdentifier(workspace.IssuePrefix, original.NumberCode, original.Number),
 				"title":      "attr original",
 				"status":     "in_progress",
 			}
