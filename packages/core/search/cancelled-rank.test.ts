@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect } from "vitest";
 import type { SearchIssueResult, SearchProjectResult } from "../types/api";
 import {
@@ -43,6 +44,24 @@ describe("parseSearchQueryNumber", () => {
     expect(parseSearchQueryNumber("MUL-APP-7")).toBe(7);
     expect(parseSearchQueryNumber("mul-app-7")).toBe(7);
   });
+
+  it("reads a three-part identifier with a digit-containing prefix", () => {
+    expect(parseSearchQueryNumber("V2-APP-7")).toBe(7);
+  });
+
+  it.each([
+    ["V2-12", 12],
+    ["  v2-12  ", 12],
+    ["A1-7", 7],
+    ["a1b2-42", 42],
+  ])("reads a digit-containing prefix in %s", (query, number) => {
+    expect(parseSearchQueryNumber(query)).toBe(number);
+  });
+
+  it.each(["12-3", "2FAS-1", "V2-0", "V2--12", "V2-12x", "V_2-12"])(
+    "does not read %s as an issue number",
+    (query) => expect(parseSearchQueryNumber(query)).toBeNull(),
+  );
 
   it("returns null for anything that is not a target", () => {
     expect(parseSearchQueryNumber("search")).toBeNull();

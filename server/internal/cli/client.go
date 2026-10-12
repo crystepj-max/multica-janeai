@@ -367,6 +367,20 @@ func (c *APIClient) DeleteJSONWithBody(ctx context.Context, path string, body an
 
 // PostJSON performs a POST request with a JSON body.
 func (c *APIClient) PostJSON(ctx context.Context, path string, body any, out any) error {
+	return c.postJSON(ctx, path, body, "", out)
+}
+
+// PostJSONWithIdempotencyKey performs a POST request with a stable
+// Idempotency-Key header. Callers should reuse the same key when retrying a
+// request whose response may have been lost.
+func (c *APIClient) PostJSONWithIdempotencyKey(ctx context.Context, path string, body any, key string, out any) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("Idempotency-Key is required")
+	}
+	return c.postJSON(ctx, path, body, key, out)
+}
+
+func (c *APIClient) postJSON(ctx context.Context, path string, body any, idempotencyKey string, out any) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -377,6 +391,9 @@ func (c *APIClient) PostJSON(ctx context.Context, path string, body any, out any
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	c.setHeaders(req)
 
 	resp, err := c.HTTPClient.Do(req)

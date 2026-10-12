@@ -14,6 +14,7 @@ import {
   EMPTY_LIST_TELEGRAM_INSTALLATIONS_RESPONSE,
   EMPTY_REDEEM_TELEGRAM_BINDING_TOKEN_RESPONSE,
   AgentTaskListSchema,
+  AgentActivityBucketListSchema,
   TaskMessageListSchema,
   AutopilotQuotaUsageSchema,
   AutopilotRunSchema,
@@ -632,6 +633,22 @@ describe("TimelineEntriesSchema", () => {
 });
 
 describe("AgentTaskListSchema", () => {
+  it("preserves the dispatch Task revision and accepts legacy Runs without it", () => {
+    const parsed = AgentTaskListSchema.parse([
+      { id: "new-run", dispatch_issue_revision: 42 },
+      { id: "legacy-run" },
+    ]);
+
+    expect(parsed[0]?.dispatch_issue_revision).toBe(42);
+    expect(parsed[1]?.dispatch_issue_revision).toBeUndefined();
+  });
+
+  it.each([0, -1, 1.5, "42", null])("degrades malformed dispatch revision without dropping the Run: %s", (value) => {
+    const parsed = AgentTaskListSchema.parse([{ id: "run", dispatch_issue_revision: value }]);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.dispatch_issue_revision).toBeUndefined();
+  });
+
   it("preserves negotiated supplement capability, ordered coverage and permission", () => {
     const parsed = AgentTaskListSchema.parse([{
       id: "run",
@@ -2354,5 +2371,21 @@ describe("TaskMessageListSchema", () => {
   it("downgrades an unknown message type instead of dropping the transcript", () => {
     const parsed = TaskMessageListSchema.parse([{ ...row, type: "video" }]);
     expect(parsed[0]?.type).toBe("text");
+  });
+});
+
+
+describe("AgentActivityBucketListSchema duration", () => {
+  const bucket = { agent_id: "a", bucket_at: "2026-09-24T00:00:00Z", task_count: 201,
+    completed_count: 201, failed_count: 0, cancelled_count: 0 };
+  it("accepts optional aggregate duration from new and old servers", () => {
+    expect(AgentActivityBucketListSchema.parse([bucket])[0]?.duration_ms).toBeUndefined();
+    expect(AgentActivityBucketListSchema.parse([{ ...bucket, duration_ms: 12600000, duration_count: 201 }])[0]?.duration_count).toBe(201);
+  });
+  it("does not discard activity counts when duration is malformed", () => {
+    const parsed = AgentActivityBucketListSchema.parse([{ ...bucket, duration_ms: "slow", duration_count: -1 }]);
+    expect(parsed[0]?.task_count).toBe(201);
+    expect(parsed[0]?.duration_ms).toBeUndefined();
+    expect(parsed[0]?.duration_count).toBeUndefined();
   });
 });

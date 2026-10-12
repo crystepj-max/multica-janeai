@@ -42,6 +42,18 @@ SELECT 1 FROM issue WHERE issue.workspace_id = $1 FOR UPDATE;
 -- name: LockWorkspaceTaskOwnerRuntimes :exec
 SELECT 1 FROM agent_runtime WHERE agent_runtime.workspace_id = $1 FOR UPDATE;
 
+-- name: CountWorkspaceTasksAwaitingStop :one
+-- Workspace deletion removes task history and runtime identity, so it must
+-- leave both in place until every owner has stopped active work and the
+-- runtime-bound cancellation acknowledgement has arrived.
+SELECT count(*) FROM agent_task_queue AS task
+WHERE (task.status IN ('dispatched', 'running', 'waiting_local_directory') OR task.cancel_ack_pending)
+  AND (
+    EXISTS (SELECT 1 FROM agent WHERE agent.id = task.agent_id AND agent.workspace_id = $1)
+    OR EXISTS (SELECT 1 FROM issue WHERE issue.id = task.issue_id AND issue.workspace_id = $1)
+    OR EXISTS (SELECT 1 FROM agent_runtime WHERE agent_runtime.id = task.runtime_id AND agent_runtime.workspace_id = $1)
+  );
+
 -- name: ListWorkspaceAgentIDFirstPage :many
 -- First page of the same walk. Split from the keyset query rather than seeded
 -- with the all-zero uuid, because that value is itself a valid uuid: a row whose
@@ -371,6 +383,9 @@ deleted_issue_subscribers AS (
     DELETE FROM issue_subscriber
     WHERE issue_id IN (SELECT id FROM ws_issues)
 ),
+deleted_issue_dispatch_requests AS (
+    DELETE FROM issue_dispatch_request WHERE workspace_id = $1
+),
 deleted_issue_labels AS (
     DELETE FROM issue_to_label
     WHERE issue_id IN (SELECT id FROM ws_issues)
@@ -555,6 +570,9 @@ WITH deleted_wakeup_receipts AS (
  DELETE FROM issue_wakeup_receipt WHERE wakeup_id IN (SELECT id FROM issue_wakeup WHERE workspace_id=$1)
 ), deleted_wakeups AS (
  DELETE FROM issue_wakeup WHERE workspace_id=$1
+),
+deleted_child_events AS (
+ DELETE FROM issue_child_event WHERE workspace_id=$1
 ),
 deleted_issues AS (
     DELETE FROM issue WHERE issue.workspace_id = $1

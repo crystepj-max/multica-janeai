@@ -71,11 +71,21 @@ func TestArchivingAChannelBoundChatSessionCancelsItsQueuedTasks(t *testing.T) {
 		t.Errorf("archived session kept its channel_chat_session_binding — inbound traffic would revive a read-only conversation")
 	}
 
-	// Post-commit lifecycle. Each of these is something BroadcastCancelledTasks
-	// does and nothing else on this path does.
-
+	// Cancellation is visible immediately, but the running task still reserves
+	// capacity until its daemon confirms it has stopped.
+	if agentStatus := f.agentStatus(t); agentStatus != "working" {
+		t.Errorf("agent status before the running task's cancel acknowledgement = %q, want working", agentStatus)
+	}
+	var ackPending bool
+	if err := testPool.QueryRow(context.Background(), `SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, f.runningTaskID).Scan(&ackPending); err != nil {
+		t.Fatalf("read running task acknowledgement state: %v", err)
+	}
+	if !ackPending {
+		t.Fatal("archiving released running task capacity before the daemon acknowledged the stop")
+	}
+	ackCancelledTaskForTest(t, f.runningTaskID, f.daemonID)
 	if agentStatus := f.agentStatus(t); agentStatus != "idle" {
-		t.Errorf("agent status after archiving its only conversation = %q, want idle — the agent keeps showing as working in the UI with no task left to finish it", agentStatus)
+		t.Errorf("agent status after the running task's cancel acknowledgement = %q, want idle", agentStatus)
 	}
 
 	if seen := f.drainCancelledEvents(); len(seen) != 2 {
@@ -270,6 +280,7 @@ func subscribeChatTaskQueued(t *testing.T, sessionID string) <-chan string {
 // 'working' with no task left.
 type archiveCancelFixture struct {
 	agentID       string
+	daemonID      string
 	sessionID     string
 	queuedTaskID  string
 	runningTaskID string
@@ -281,7 +292,7 @@ func newArchiveCancelFixture(t *testing.T, agentName string) *archiveCancelFixtu
 	ctx := context.Background()
 
 	f := &archiveCancelFixture{}
-	f.agentID = createHandlerTestAgent(t, agentName, []byte("[]"))
+	f.agentID, _, f.daemonID = createRuntimeGuardAgent(t, ctx)
 	f.sessionID = createHandlerTestChatSession(t, f.agentID)
 	f.queuedTaskID = queueArchiveTestTask(t, f.agentID, f.sessionID, "queued")
 	f.runningTaskID = queueArchiveTestTask(t, f.agentID, f.sessionID, "running")

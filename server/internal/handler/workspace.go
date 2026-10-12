@@ -271,7 +271,8 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "workspace slug already exists")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to create workspace: "+err.Error())
+		slog.Warn("create workspace failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to create workspace")
 		return
 	}
 
@@ -281,7 +282,8 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		Role:        "owner",
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to add owner: "+err.Error())
+		slog.Warn("add owner failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to add owner")
 		return
 	}
 
@@ -289,7 +291,8 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	// workspace is never visible without its status catalog — an issue cannot
 	// be created before its status can be resolved. (MUL-6243)
 	if err := issuestatus.Ensure(r.Context(), qtx, ws.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to seed issue statuses: "+err.Error())
+		slog.Warn("seed issue statuses failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to seed issue statuses")
 		return
 	}
 
@@ -401,6 +404,17 @@ func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 		params.Context = pgtype.Text{String: *req.Context, Valid: true}
 	}
 	if req.Settings != nil {
+		if incoming, ok := req.Settings.(map[string]any); ok {
+			// Only an old client's flip of the retired PR switch needs the
+			// stored value; see reconcilePRMergeSettings.
+			var stored map[string]any
+			if _, sent := incoming[prAutoCompleteLegacyKey]; sent {
+				if existing, err := h.Queries.GetWorkspace(r.Context(), idUUID); err == nil {
+					_ = json.Unmarshal(existing.Settings, &stored)
+				}
+			}
+			reconcilePRMergeSettings(stored, incoming)
+		}
 		s, _ := json.Marshal(req.Settings)
 		params.Settings = s
 	}
@@ -440,7 +454,7 @@ func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 	ws, err := h.Queries.UpdateWorkspace(r.Context(), params)
 	if err != nil {
 		slog.Warn("update workspace failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", id)...)
-		writeError(w, http.StatusInternalServerError, "failed to update workspace: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to update workspace")
 		return
 	}
 
@@ -676,6 +690,13 @@ func (h *Handler) DeleteMember(w http.ResponseWriter, r *http.Request) {
 	requesterUserID := requestUserID(r)
 	result, err := h.revokeAndRemoveMember(r.Context(), target.WorkspaceID, target.UserID, target.ID, parseUUID(requesterUserID))
 	if err != nil {
+		if errors.Is(err, errMemberRunsNotDrained) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "This member still has active or stopping Runs. Stop them and wait for their runtimes to confirm they have ended before removing the member.",
+				"code":  "workspace_member_runs_not_drained",
+			})
+			return
+		}
 		slog.Warn("delete member failed", append(logger.RequestAttrs(r), "error", err, "member_id", memberID, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to delete member")
 		return
@@ -720,6 +741,13 @@ func (h *Handler) LeaveWorkspace(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.revokeAndRemoveMember(r.Context(), member.WorkspaceID, member.UserID, member.ID, member.UserID)
 	if err != nil {
+		if errors.Is(err, errMemberRunsNotDrained) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "You still have active or stopping Runs. Stop them and wait for their runtimes to confirm they have ended before leaving the workspace.",
+				"code":  "workspace_member_runs_not_drained",
+			})
+			return
+		}
 		slog.Warn("leave workspace failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to leave workspace")
 		return
@@ -800,6 +828,14 @@ func isRetryableLockFailure(err error) bool {
 // with a message the delete dialog can show; every other failure stays a 500.
 func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, step string, err error) {
 	attrs := append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID, "step", step)
+	if errors.Is(err, errWorkspaceRunsNotDrained) {
+		slog.Warn("workspace delete blocked by active or stopping Runs", attrs...)
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "This workspace still has active or stopping Runs. Stop them and wait for their runtimes to confirm they have ended before deleting the workspace.",
+			"code":  "workspace_delete_not_drained",
+		})
+		return
+	}
 	if isRetryableLockFailure(err) {
 		slog.Warn("workspace delete blocked by lock contention", attrs...)
 		writeError(w, http.StatusServiceUnavailable, "workspace deletion is temporarily blocked by another operation, please try again")
@@ -808,6 +844,8 @@ func failWorkspaceDelete(w http.ResponseWriter, r *http.Request, workspaceID, st
 	slog.Warn("workspace delete step failed", attrs...)
 	writeError(w, http.StatusInternalServerError, "failed to delete workspace")
 }
+
+var errWorkspaceRunsNotDrained = errors.New("workspace has active or stopping Runs")
 
 // workspaceDeleteTaskPageSize bounds one task page: the ids held in this process,
 // the array parameter sent back to Postgres, and the row count of a single
@@ -1168,6 +1206,22 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return lockWorkspaceTaskOwners(ctx, qtx, requester.WorkspaceID) },
 		},
 		{
+			// Deleting the workspace also deletes task rows and runtime identity.
+			// Keep both intact until every active Run has stopped and its owner
+			// has acknowledged cancellation.
+			name: "check active Runs",
+			run: func() error {
+				count, err := qtx.CountWorkspaceTasksAwaitingStop(ctx, requester.WorkspaceID)
+				if err != nil {
+					return err
+				}
+				if count > 0 {
+					return errWorkspaceRunsNotDrained
+				}
+				return nil
+			},
+		},
+		{
 			name: "prepare relationship graph",
 			run:  func() error { return qtx.PrepareWorkspaceDeletionLinks(ctx, requester.WorkspaceID) },
 		},
@@ -1239,6 +1293,12 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		{
 			name: "delete comments",
 			run:  func() error { return qtx.DeleteWorkspaceComments(ctx, requester.WorkspaceID) },
+		},
+		{
+			// Teardown mode keeps the triggers from logging the deletes above
+			// and below; this clears what normal writes logged before.
+			name: "delete search index changes",
+			run:  func() error { return qtx.DeleteWorkspaceSearchIndexChanges(ctx, requester.WorkspaceID) },
 		},
 		// Keep source-context object intents after the workspace row is gone.
 		// They are the durable retry ledger for an upload that began before the

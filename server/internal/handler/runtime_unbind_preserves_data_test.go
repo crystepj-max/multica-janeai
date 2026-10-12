@@ -141,15 +141,71 @@ func TestUnbindAgentsAndDeleteRuntime_KeepsTaskHistory(t *testing.T) {
 		t.Fatalf("insert task usage: %v", err)
 	}
 	runningTask := insertFixtureTask(t, ctx, runtimeID, agentID, "running", false)
+	daemonID := "runtime-drain-ack-test"
+	if _, err := testPool.Exec(ctx, `UPDATE agent_runtime SET daemon_id = $2 WHERE id = $1`, runtimeID, daemonID); err != nil {
+		t.Fatalf("set runtime daemon identity: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/runtimes/"+runtimeID+"/unbind-agents-and-delete",
+		map[string]any{"expected_active_agent_ids": []string{agentID}})
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.UnbindAgentsAndDeleteRuntime(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete with an active Run: expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+	var runtimeRows int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&runtimeRows); err != nil {
+		t.Fatalf("confirm runtime remains available for stop acknowledgement: %v", err)
+	}
+	if runtimeRows != 1 {
+		t.Fatalf("runtime rows after blocked delete = %d, want 1", runtimeRows)
+	}
+	var activeState string
+	if err := testPool.QueryRow(ctx,
+		`SELECT status FROM agent_task_queue WHERE id = $1`, runningTask).Scan(&activeState); err != nil {
+		t.Fatalf("read Run after blocked delete: %v", err)
+	}
+	if activeState != "running" {
+		t.Fatalf("active Run status after blocked delete = %q, want running", activeState)
+	}
+
+	if _, err := testHandler.TaskService.CancelTask(ctx, parseUUID(runningTask)); err != nil {
+		t.Fatalf("request stop for active Run: %v", err)
+	}
+	ackReq := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+runningTask+"/cancel-ack", nil,
+		testWorkspaceID, "different-daemon")
+	ackReq = withURLParam(ackReq, "taskId", runningTask)
+	ackResponse := httptest.NewRecorder()
+	testHandler.AckTaskCancelled(ackResponse, ackReq)
+	if ackResponse.Code != http.StatusNotFound {
+		t.Fatalf("cancel ack from a different runtime: expected 404, got %d: %s", ackResponse.Code, ackResponse.Body.String())
+	}
+	var ackPending bool
+	if err := testPool.QueryRow(ctx,
+		`SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, runningTask).Scan(&ackPending); err != nil {
+		t.Fatalf("read pending cancellation after rejected ack: %v", err)
+	}
+	if !ackPending {
+		t.Fatal("ack from a different runtime released the stop reservation")
+	}
+
+	ackReq = newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+runningTask+"/cancel-ack", nil,
+		testWorkspaceID, daemonID)
+	ackReq = withURLParam(ackReq, "taskId", runningTask)
+	ackResponse = httptest.NewRecorder()
+	testHandler.AckTaskCancelled(ackResponse, ackReq)
+	if ackResponse.Code != http.StatusOK {
+		t.Fatalf("cancel ack: expected 200, got %d: %s", ackResponse.Code, ackResponse.Body.String())
+	}
 
 	unbindRuntime(t, ctx, runtimeID, agentID)
 
 	var (
-		taskRows    int
-		taskBound   bool
-		msgRows     int
-		usageRows   int
-		activeState string
+		taskRows  int
+		taskBound bool
+		msgRows   int
+		usageRows int
 	)
 	if err := testPool.QueryRow(ctx,
 		`SELECT count(*) FROM agent_task_queue WHERE id = $1`, doneTask).Scan(&taskRows); err != nil {
@@ -183,11 +239,67 @@ func TestUnbindAgentsAndDeleteRuntime_KeepsTaskHistory(t *testing.T) {
 	// The in-flight task is cancelled rather than deleted, so the record of it
 	// having been interrupted survives too.
 	if err := testPool.QueryRow(ctx,
-		`SELECT status FROM agent_task_queue WHERE id = $1`, runningTask).Scan(&activeState); err != nil {
-		t.Fatalf("read running task status: %v", err)
+		`SELECT status, cancel_ack_pending FROM agent_task_queue WHERE id = $1`, runningTask).Scan(&activeState, &ackPending); err != nil {
+		t.Fatalf("read stopped task status: %v", err)
 	}
 	if activeState != "cancelled" {
 		t.Fatalf("in-flight task status = %q, want cancelled", activeState)
+	}
+	if ackPending {
+		t.Fatalf("cancelled task still has a pending stop acknowledgement after teardown")
+	}
+}
+
+func TestAckTaskCancelled_PersonalAccessTokenRequiresRuntimeOwnerIdentity(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createCascadeFixtureRuntime(t, ctx, "Cancel ACK PAT Runtime")
+	agentID := createCascadeFixtureAgent(t, ctx, runtimeID, "Cancel ACK PAT Agent")
+	daemonID := "cancel-ack-pat-identity-daemon"
+	if _, err := testPool.Exec(ctx, `UPDATE agent_runtime SET daemon_id = $2 WHERE id = $1`, runtimeID, daemonID); err != nil {
+		t.Fatalf("set runtime daemon identity: %v", err)
+	}
+	taskID := insertFixtureTask(t, ctx, runtimeID, agentID, "running", false)
+	if _, err := testHandler.TaskService.CancelTask(ctx, parseUUID(taskID)); err != nil {
+		t.Fatalf("request stop for active Run: %v", err)
+	}
+
+	newPATAckRequest := func(clientDaemonID string) *http.Request {
+		req := newRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/cancel-ack", nil)
+		req.Header.Set("X-Client-Daemon-ID", clientDaemonID)
+		return withURLParam(req, "taskId", taskID)
+	}
+	callAck := func(req *http.Request) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		testHandler.AckTaskCancelled(response, req)
+		return response
+	}
+
+	wrongDaemonResponse := callAck(newPATAckRequest("different-daemon"))
+	if wrongDaemonResponse.Code != http.StatusNotFound {
+		t.Fatalf("cancel ack from a different runtime: expected 404, got %d: %s", wrongDaemonResponse.Code, wrongDaemonResponse.Body.String())
+	}
+	var ackPending bool
+	if err := testPool.QueryRow(ctx,
+		`SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, taskID).Scan(&ackPending); err != nil {
+		t.Fatalf("read pending cancellation after rejected ack: %v", err)
+	}
+	if !ackPending {
+		t.Fatal("ack from a different runtime released the stop reservation")
+	}
+
+	correctDaemonResponse := callAck(newPATAckRequest(daemonID))
+	if correctDaemonResponse.Code != http.StatusOK {
+		t.Fatalf("cancel ack from the runtime owner: expected 200, got %d: %s", correctDaemonResponse.Code, correctDaemonResponse.Body.String())
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, taskID).Scan(&ackPending); err != nil {
+		t.Fatalf("read pending cancellation after accepted ack: %v", err)
+	}
+	if ackPending {
+		t.Fatal("runtime owner's ack did not release the stop reservation")
 	}
 }
 
@@ -501,11 +613,22 @@ func insertFixtureTask(t *testing.T, ctx context.Context, runtimeID, agentID, st
 	if terminal {
 		completedAt = "now()"
 	}
+	// This fixture has no issue, chat, or autopilot association, so Quick Create
+	// context provides the workspace required for daemon authorization.
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, status, context, completed_at)
-		VALUES ($1, $2, $3, '{"fixture":true}'::jsonb, `+completedAt+`)
+		VALUES (
+			$1, $2, $3,
+			jsonb_build_object(
+				'type', 'quick_create',
+				'workspace_id', $4::text,
+				'requester_id', $5::text,
+				'prompt', 'handler fixture task'
+			),
+			`+completedAt+`
+		)
 		RETURNING id
-	`, agentID, runtimeID, status).Scan(&taskID); err != nil {
+	`, agentID, runtimeID, status, testWorkspaceID, testUserID).Scan(&taskID); err != nil {
 		t.Fatalf("insert fixture task (%s): %v", status, err)
 	}
 	t.Cleanup(func() {

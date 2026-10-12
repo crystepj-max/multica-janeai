@@ -3749,6 +3749,7 @@ func newIssueUpdateTestCmd() *cobra.Command {
 	cmd.Flags().Int("stage", 0, "")
 	cmd.Flags().Float64("position", 0, "")
 	cmd.Flags().Bool("no-start", false, "")
+	cmd.Flags().String("duplicate-of", "", "")
 	cmd.Flags().String("output", "json", "")
 	return cmd
 }
@@ -3863,6 +3864,7 @@ func newIssueAssignTestCmd() *cobra.Command {
 func newIssueStatusTestCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "status"}
 	cmd.Flags().Bool("no-start", false, "")
+	cmd.Flags().String("duplicate-of", "", "")
 	cmd.Flags().String("output", "table", "")
 	return cmd
 }
@@ -3992,6 +3994,137 @@ func TestRunIssueStatusNoStartSendsSuppressRun(t *testing.T) {
 	}
 }
 
+// newDuplicateMarkTestServer serves MUL-1 (the original) and MUL-2 (the
+// duplicate) and records the body of the PUT to MUL-2. With recorded=false it
+// answers like a server older than the duplicate mark: no duplicate_of field.
+func newDuplicateMarkTestServer(t *testing.T, recorded bool, body *map[string]any) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/issues/MUL-1":
+			json.NewEncoder(w).Encode(map[string]any{"id": "issue-1", "identifier": "MUL-1", "status": "todo"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/issues/MUL-2":
+			json.NewEncoder(w).Encode(map[string]any{"id": "issue-2", "identifier": "MUL-2", "status": "todo"})
+		case r.Method == http.MethodPut && r.URL.Path == "/api/issues/issue-2":
+			if err := json.NewDecoder(r.Body).Decode(body); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			resp := map[string]any{"id": "issue-2", "identifier": "MUL-2", "status": "cancelled"}
+			if recorded {
+				resp["duplicate_of"] = map[string]any{"id": "issue-1", "identifier": "MUL-1", "status": "todo"}
+			}
+			json.NewEncoder(w).Encode(resp)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	setCLITestServerEnv(t, srv.URL)
+	t.Setenv("MULTICA_TASK_CONFIG_ROOT", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "mat_test-token")
+	return srv
+}
+
+func TestRunIssueStatusDuplicateOfSendsMark(t *testing.T) {
+	var body map[string]any
+	newDuplicateMarkTestServer(t, true, &body)
+
+	cmd := newIssueStatusTestCmd()
+	_ = cmd.Flags().Set("duplicate-of", "MUL-1")
+	if err := runIssueStatus(cmd, []string{"MUL-2", "cancelled"}); err != nil {
+		t.Fatalf("runIssueStatus: %v", err)
+	}
+	want := map[string]any{"status": "cancelled", "duplicate_of_issue_id": "issue-1"}
+	if !reflect.DeepEqual(body, want) {
+		t.Fatalf("body = %#v, want %#v", body, want)
+	}
+}
+
+func TestRunIssueUpdateDuplicateOfSendsMark(t *testing.T) {
+	var body map[string]any
+	newDuplicateMarkTestServer(t, true, &body)
+
+	cmd := newIssueUpdateTestCmd()
+	_ = cmd.Flags().Set("duplicate-of", "MUL-1")
+	if err := runIssueUpdate(cmd, []string{"MUL-2"}); err != nil {
+		t.Fatalf("runIssueUpdate: %v", err)
+	}
+	// The server cancels the issue with the mark; no status is needed.
+	want := map[string]any{"duplicate_of_issue_id": "issue-1"}
+	if !reflect.DeepEqual(body, want) {
+		t.Fatalf("body = %#v, want %#v", body, want)
+	}
+}
+
+func TestRunIssueDuplicateOfFailsWhenServerDropsMark(t *testing.T) {
+	var body map[string]any
+	newDuplicateMarkTestServer(t, false, &body)
+
+	statusCmd := newIssueStatusTestCmd()
+	_ = statusCmd.Flags().Set("duplicate-of", "MUL-1")
+	err := runIssueStatus(statusCmd, []string{"MUL-2", "cancelled"})
+	if err == nil || !strings.Contains(err.Error(), "did not record the duplicate mark") {
+		t.Fatalf("runIssueStatus error = %v, want a missing-mark error", err)
+	}
+
+	updateCmd := newIssueUpdateTestCmd()
+	_ = updateCmd.Flags().Set("duplicate-of", "MUL-1")
+	err = runIssueUpdate(updateCmd, []string{"MUL-2"})
+	if err == nil || !strings.Contains(err.Error(), "did not record the duplicate mark") {
+		t.Fatalf("runIssueUpdate error = %v, want a missing-mark error", err)
+	}
+}
+
+func TestRunIssueDuplicateOfRejectsInvalidCombinationsBeforeRequest(t *testing.T) {
+	t.Chdir(t.TempDir())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	setCLITestServerEnv(t, srv.URL)
+	attachment := writeIssueCreateAttachment(t, "shot.png")
+
+	t.Run("status other than cancelled", func(t *testing.T) {
+		cmd := newIssueStatusTestCmd()
+		_ = cmd.Flags().Set("duplicate-of", "MUL-1")
+		err := runIssueStatus(cmd, []string{"MUL-2", "done"})
+		if err == nil || !strings.Contains(err.Error(), "must be cancelled") {
+			t.Fatalf("error = %v, want a must-be-cancelled error", err)
+		}
+	})
+	t.Run("empty reference", func(t *testing.T) {
+		cmd := newIssueStatusTestCmd()
+		_ = cmd.Flags().Set("duplicate-of", " ")
+		err := runIssueStatus(cmd, []string{"MUL-2", "cancelled"})
+		if err == nil || !strings.Contains(err.Error(), "requires the original issue") {
+			t.Fatalf("error = %v, want a missing-reference error", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		flag  string
+		value string
+		want  string
+	}{
+		{"update status other than cancelled", "status", "todo", "must be cancelled"},
+		{"update description", "description", "new body", "cannot be combined"},
+		{"update attachment", "attachment", attachment, "cannot be combined"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newIssueUpdateTestCmd()
+			_ = cmd.Flags().Set("duplicate-of", "MUL-1")
+			_ = cmd.Flags().Set(tc.flag, tc.value)
+			err := runIssueUpdate(cmd, []string{"MUL-2"})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunIssueAssignNoStartSendsSuppressRun(t *testing.T) {
 	const agentID = "5fb87ac7-23b5-4a7a-81fa-ed295a54545d"
 	var body map[string]any
@@ -4043,7 +4176,7 @@ func TestRunIssueAssignRejectsNoStartWithUnassign(t *testing.T) {
 func TestIssueReadCommandsUseInjectedTaskToken(t *testing.T) {
 	const fakeTaskToken = "mat_task_issue_sentinel"
 	ownerHome := t.TempDir()
-	t.Setenv("HOME", ownerHome)
+	redirectTestHome(t, ownerHome)
 	t.Setenv("MULTICA_AGENT_ID", "agent-test")
 	t.Setenv("MULTICA_TASK_ID", "task-test")
 	t.Setenv("MULTICA_TOKEN", fakeTaskToken)
@@ -4109,7 +4242,7 @@ func TestIssueReadCommandsUseInjectedTaskToken(t *testing.T) {
 
 func TestIssueReadCommandsFailClosedWithoutTaskToken(t *testing.T) {
 	ownerHome := t.TempDir()
-	t.Setenv("HOME", ownerHome)
+	redirectTestHome(t, ownerHome)
 	t.Setenv("MULTICA_AGENT_ID", "agent-test")
 	t.Setenv("MULTICA_TASK_ID", "task-test")
 	t.Setenv("MULTICA_TOKEN", "")
@@ -5235,6 +5368,73 @@ func TestRunIssueRunsScopeFlagsBuildQuery(t *testing.T) {
 // list of task ids the reader cannot attribute, which is the whole question
 // --siblings answers — and it drops COMPLETED / ERROR, which are empty on
 // every row of a read that only returns work still in flight.
+func TestRunIssueRunsJSONPreservesDispatchIssueRevision(t *testing.T) {
+	const issueID = "1881a167-4bb6-4602-944b-f40ce4192fe6"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/issues/"+issueID+"/task-runs" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": "run-1", "dispatch_issue_revision": 42}})
+	}))
+	defer srv.Close()
+	setCLITestServerEnv(t, srv.URL)
+
+	cmd := newIssueRunsTestCmd(t, "json")
+	out, err := captureStdout(t, func() error { return runIssueRuns(cmd, []string{issueID}) })
+	if err != nil {
+		t.Fatalf("runIssueRuns: %v", err)
+	}
+	var runs []map[string]any
+	if err := json.Unmarshal([]byte(out), &runs); err != nil {
+		t.Fatalf("decode issue runs JSON %q: %v", out, err)
+	}
+	if len(runs) != 1 || runs[0]["dispatch_issue_revision"] != float64(42) {
+		t.Fatalf("runs = %#v, want dispatch_issue_revision 42", runs)
+	}
+}
+
+func TestRunIssueDispatchJSONPreservesDispatchIssueRevision(t *testing.T) {
+	const issueID = "1881a167-4bb6-4602-944b-f40ce4192fe6"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/issues/"+issueID+"/dispatch" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode dispatch request: %v", err)
+		}
+		if body["expected_revision"] != float64(7) {
+			t.Fatalf("dispatch body = %#v, want expected_revision 7", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "run-1", "issue_id": issueID, "status": "queued",
+			"agent_id": "agent-1", "runtime_id": "runtime-1", "dispatch_issue_revision": 7,
+		})
+	}))
+	defer srv.Close()
+	setCLITestServerEnv(t, srv.URL)
+
+	cmd := &cobra.Command{Use: "dispatch"}
+	cmd.Flags().String("idempotency-key", "", "")
+	cmd.Flags().Int64("expected-revision", 0, "")
+	cmd.Flags().String("output", "json", "")
+	_ = cmd.Flags().Set("idempotency-key", "issue-revision-7")
+	_ = cmd.Flags().Set("expected-revision", "7")
+	out, err := captureStdout(t, func() error { return runIssueDispatch(cmd, []string{issueID}) })
+	if err != nil {
+		t.Fatalf("runIssueDispatch: %v", err)
+	}
+	var run map[string]any
+	if err := json.Unmarshal([]byte(out), &run); err != nil {
+		t.Fatalf("decode dispatch JSON %q: %v", out, err)
+	}
+	if run["dispatch_issue_revision"] != float64(7) {
+		t.Fatalf("dispatch response = %#v, want dispatch_issue_revision 7", run)
+	}
+}
+
 func TestRunIssueRunsSiblingsTableRendersFamilyColumns(t *testing.T) {
 	issueID := "1881a167-4bb6-4602-944b-f40ce4192fe6"
 

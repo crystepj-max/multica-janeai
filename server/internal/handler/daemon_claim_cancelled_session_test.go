@@ -315,12 +315,34 @@ func TestCancelTask_PointerAdvanceIsAtomicWithStatusFlip(t *testing.T) {
 	if got := taskStatus(t, taskID); got != "cancelled" {
 		t.Fatalf("task status = %q, want cancelled", got)
 	}
+	var ackPending bool
+	if err := testPool.QueryRow(ctx, `SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, taskID).Scan(&ackPending); err != nil {
+		t.Fatalf("read cancellation acknowledgement state: %v", err)
+	}
+	if !ackPending {
+		t.Fatal("cancelled running task released capacity before the daemon acknowledged the stop")
+	}
+	ackCancelledTaskForTest(t, taskID, daemonID)
+	if err := testPool.QueryRow(ctx, `SELECT cancel_ack_pending FROM agent_task_queue WHERE id = $1`, taskID).Scan(&ackPending); err != nil {
+		t.Fatalf("read cancellation acknowledgement state after ack: %v", err)
+	}
+	if ackPending {
+		t.Fatal("daemon acknowledgement did not release the cancelled task's capacity")
+	}
 
 	// The queued follow-up now claims onto the cancelled turn's session.
 	task := claimTaskForRuntimeGuard(t, runtimeID, daemonID)
 	if task.PriorSessionID != "turn2-session" {
 		t.Fatalf("PriorSessionID = %q, want turn2-session", task.PriorSessionID)
 	}
+}
+
+func ackCancelledTaskForTest(t *testing.T, taskID, daemonID string) {
+	t.Helper()
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/cancel-ack", nil,
+		testWorkspaceID, daemonID)
+	req = withURLParam(req, "taskId", taskID)
+	testutil.Call(t, testHandler.AckTaskCancelled, req).Want(http.StatusOK)
 }
 
 // TestPinTaskSession_LateCancelledPinAdvancesChatPointer covers the other
