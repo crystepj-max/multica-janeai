@@ -2,8 +2,8 @@ package handler
 
 import (
 	"encoding/json"
-	"net/http/httptest"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -33,6 +33,11 @@ func createIssueForIdentifierTest(t *testing.T, payload map[string]any) IssueRes
 	w := testutil.Call(t, testHandler.CreateIssue, req).Want(http.StatusCreated)
 	var issue IssueResponse
 	json.NewDecoder(w.Body).Decode(&issue)
+	t.Cleanup(func() {
+		del := newRequest("DELETE", "/api/issues/"+issue.ID, nil)
+		del = withURLParam(del, "id", issue.ID)
+		testHandler.DeleteIssue(httptest.NewRecorder(), del)
+	})
 	return issue
 }
 
@@ -65,10 +70,21 @@ func TestProjectNumberedIssueIdentifier(t *testing.T) {
 		t.Fatalf("derived project code = %q; want QTZ", project.Code)
 	}
 
-	// A projectless issue first: it takes workspace number 1.
-	plain := createIssueForIdentifierTest(t, map[string]any{"title": "Workspace-numbered issue"})
-	if plain.Identifier != "MUL-1" {
-		t.Fatalf("projectless identifier = %q; want MUL-1", plain.Identifier)
+	// Seed the workspace-numbered counterpart deterministically at number 1
+	// (the fixture's workspace counter advances across test runs, so an
+	// API-created projectless issue would get an arbitrary number and the
+	// shared-number ambiguity below would not hold).
+	plainID := dbfx.Issue(t, "Workspace-numbered issue", testutil.Cols{
+		"workspace_id": testWorkspaceID,
+		"creator_type": "member",
+		"creator_id":   testUserID,
+		"number":       1,
+		"status":       "todo",
+		"priority":     "medium",
+	})
+	plainByID := getIssueByIdentifier(t, plainID)
+	if plainByID == nil || plainByID.Identifier != "MUL-1" {
+		t.Fatalf("projectless issue renders %+v; want MUL-1", plainByID)
 	}
 
 	first := createIssueForIdentifierTest(t, map[string]any{
@@ -111,8 +127,8 @@ func TestProjectNumberedIssueIdentifier(t *testing.T) {
 	// workspace-numbered issue — the project issue reusing number 1 must not
 	// hijack the legacy identifier.
 	got := getIssueByIdentifier(t, "MUL-1")
-	if got == nil || got.ID != plain.ID {
-		t.Fatalf("GetIssue(MUL-1) resolved %+v; want projectless issue %s", got, plain.ID)
+	if got == nil || got.ID != plainID {
+		t.Fatalf("GetIssue(MUL-1) resolved %+v; want projectless issue %s", got, plainID)
 	}
 
 	// Wrong code and wrong prefix never resolve.
@@ -162,7 +178,7 @@ func TestProjectNumberedIssueIdentifier(t *testing.T) {
 }
 
 // TestLegacyProjectLazyCodeDerivation covers projects created before project
-// codes existed (code = ''): their first project issue derives and persists a
+// codes existed (code = ”): their first project issue derives and persists a
 // code inside the create transaction, and later issues reuse it.
 func TestLegacyProjectLazyCodeDerivation(t *testing.T) {
 	setWorkspaceIssuePrefixForTest(t, "MUL")
@@ -197,5 +213,114 @@ func TestLegacyProjectLazyCodeDerivation(t *testing.T) {
 	}
 	if again.Identifier == issue.Identifier {
 		t.Fatalf("second identifier %q repeats the first project number", again.Identifier)
+	}
+}
+
+// TestReusedProjectCodeSkipsGhostSnapshotNumbers covers the delete-and-recreate
+// path: deleting a project leaves its issues' code snapshots in place, so a
+// new project deriving the same code must skip numbers those ghosts hold
+// instead of failing the create.
+func TestReusedProjectCodeSkipsGhostSnapshotNumbers(t *testing.T) {
+	setWorkspaceIssuePrefixForTest(t, "MUL")
+
+	first := createProjectForIdentifierTest(t, map[string]any{"title": "擎天柱工程"})
+	ghost := createIssueForIdentifierTest(t, map[string]any{
+		"title":      "Ghost holder",
+		"project_id": first.ID,
+	})
+	if ghost.Identifier != "MUL-QTZ-1" {
+		t.Fatalf("ghost identifier = %q; want MUL-QTZ-1", ghost.Identifier)
+	}
+
+	// Delete the project; the issue survives with its snapshot code.
+	del := newRequest("DELETE", "/api/projects/"+first.ID, nil)
+	del = withURLParam(del, "id", first.ID)
+	testHandler.DeleteProject(httptest.NewRecorder(), del)
+
+	// A new project with the same title derives the same code.
+	second := createProjectForIdentifierTest(t, map[string]any{"title": "擎天柱工程"})
+	reborn := createIssueForIdentifierTest(t, map[string]any{
+		"title":      "Reborn project issue",
+		"project_id": second.ID,
+	})
+	if reborn.Identifier != "MUL-QTZ-2" {
+		t.Fatalf("reborn identifier = %q; want MUL-QTZ-2 (skipping the ghost's number)", reborn.Identifier)
+	}
+}
+
+// TestProjectIssueIdentifierAcrossSurfaces is the regression net for
+// render-side query drift: several surfaces hand-write their issue SELECT
+// (project board rows, issue list, grouped list, search). Any of them
+// omitting the number_code column degrades project issues to "PREFIX-N" even
+// though the row stores the code — the board showed MARS-1 while the database
+// held MARS-QTZ-1 until this was covered.
+func TestProjectIssueIdentifierAcrossSurfaces(t *testing.T) {
+	setWorkspaceIssuePrefixForTest(t, "MUL")
+
+	project := createProjectForIdentifierTest(t, map[string]any{"title": "擎天柱工程"})
+	created := createIssueForIdentifierTest(t, map[string]any{
+		"title":      "Surface render issue",
+		"project_id": project.ID,
+	})
+	if created.Identifier != "MUL-QTZ-1" {
+		t.Fatalf("created identifier = %q; want MUL-QTZ-1", created.Identifier)
+	}
+
+	// Project board rows — the project page surface (dynamic SELECT).
+	groupKey := "status:todo"
+	tableW := testutil.Call(t, testHandler.ListIssueTableRows, newRequest("POST", "/api/issues/table/rows", issueTableRowsRequest{
+		Query: issueTableQuerySpec{
+			Scope: issueTableScope{Kind: "project", ProjectID: project.ID},
+			Sort:  issueTableSortRequest{Field: "position", Direction: "asc"},
+		},
+		Group:     issueTableGroupSpec{Kind: "status"},
+		GroupKey:  &groupKey,
+		Hierarchy: issueTableHierarchyRequest{Enabled: false},
+		Page:      issueTablePageRequest{Limit: 10},
+	})).Want(http.StatusOK)
+	var tableResponse issueTableRowsResponse
+	json.NewDecoder(tableW.Body).Decode(&tableResponse)
+	if len(tableResponse.Rows) != 1 || tableResponse.Rows[0].Issue.ID != created.ID ||
+		tableResponse.Rows[0].Issue.Identifier != "MUL-QTZ-1" {
+		t.Fatalf("table rows = %+v; want issue %s as MUL-QTZ-1", tableResponse.Rows, created.ID)
+	}
+
+	// Issue list (dynamic SELECT).
+	listW := testutil.Call(t, testHandler.ListIssues, newRequest("GET", "/api/issues?project_id="+project.ID, nil)).Want(http.StatusOK)
+	var listResponse struct {
+		Issues []IssueResponse `json:"issues"`
+	}
+	json.NewDecoder(listW.Body).Decode(&listResponse)
+	if len(listResponse.Issues) != 1 || listResponse.Issues[0].Identifier != "MUL-QTZ-1" {
+		t.Fatalf("list = %+v; want MUL-QTZ-1", listResponse.Issues)
+	}
+
+	// Grouped list.
+	groupedW := testutil.Call(t, testHandler.ListGroupedIssues, newRequest("GET", "/api/issues/grouped?group_by=assignee", nil)).Want(http.StatusOK)
+	var grouped GroupedIssuesResponse
+	json.NewDecoder(groupedW.Body).Decode(&grouped)
+	found := false
+	for _, g := range grouped.Groups {
+		for _, gi := range g.Issues {
+			if gi.ID == created.ID {
+				found = true
+				if gi.Identifier != "MUL-QTZ-1" {
+					t.Fatalf("grouped identifier = %q; want MUL-QTZ-1", gi.Identifier)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("grouped response missing issue %s: %+v", created.ID, grouped)
+	}
+
+	// Search.
+	searchW := testutil.Call(t, testHandler.SearchIssues, newRequest("GET", "/api/issues/search?q="+url.QueryEscape("Surface render issue"), nil)).Want(http.StatusOK)
+	var searchResponse struct {
+		Issues []IssueResponse `json:"issues"`
+	}
+	json.NewDecoder(searchW.Body).Decode(&searchResponse)
+	if len(searchResponse.Issues) != 1 || searchResponse.Issues[0].Identifier != "MUL-QTZ-1" {
+		t.Fatalf("search = %+v; want MUL-QTZ-1", searchResponse.Issues)
 	}
 }

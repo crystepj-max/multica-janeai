@@ -273,14 +273,53 @@ func findSearchParityRow(rows []searchParityRow, id string) (searchParityRow, bo
 }
 
 func runCandidateSearchForParity(t *testing.T, query string, args []any) []searchParityRow {
-	return runSearchForParity(t, "candidate", query, args)
+	return runSearchForParity(t, "candidate", query, args, true)
 }
 
 func runLegacySearchForParity(t *testing.T, query string, args []any) []searchParityRow {
-	return runSearchForParity(t, "legacy", query, args)
+	// The frozen legacy query predates the number_code identifier column
+	// and still projects the 25-column list it always did.
+	return runSearchForParity(t, "legacy", query, args, false)
 }
 
-func runSearchForParity(t *testing.T, label, query string, args []any) []searchParityRow {
+// searchParityDestinations mirrors the shared scan order; the candidate query
+// projects number_code between number and project_id, the legacy one does not.
+func searchParityDestinations(sr *searchResult, projectsNumberCode bool) []any {
+	dests := []any{
+		&sr.issue.ID,
+		&sr.issue.WorkspaceID,
+		&sr.issue.Title,
+		&sr.issue.Description,
+		&sr.issue.Status,
+		&sr.issue.Priority,
+		&sr.issue.AssigneeType,
+		&sr.issue.AssigneeID,
+		&sr.issue.CreatorType,
+		&sr.issue.CreatorID,
+		&sr.issue.ParentIssueID,
+		&sr.issue.AcceptanceCriteria,
+		&sr.issue.ContextRefs,
+		&sr.issue.Position,
+		&sr.issue.StartDate,
+		&sr.issue.DueDate,
+		&sr.issue.CreatedAt,
+		&sr.issue.UpdatedAt,
+		&sr.issue.LastActivityAt,
+		&sr.issue.Number,
+	}
+	if projectsNumberCode {
+		dests = append(dests, &sr.issue.NumberCode)
+	}
+	return append(dests,
+		&sr.issue.ProjectID,
+		&sr.issue.Revision,
+		&sr.issue.DuplicateOfIssueID,
+		&sr.matchSource,
+		&sr.matchedCommentContent,
+	)
+}
+
+func runSearchForParity(t *testing.T, label, query string, args []any, projectsNumberCode bool) []searchParityRow {
 	t.Helper()
 	rows, err := testPool.Query(context.Background(), query, args...)
 	if err != nil {
@@ -291,33 +330,7 @@ func runSearchForParity(t *testing.T, label, query string, args []any) []searchP
 	var result []searchParityRow
 	for rows.Next() {
 		var sr searchResult
-		if err := rows.Scan(
-			&sr.issue.ID,
-			&sr.issue.WorkspaceID,
-			&sr.issue.Title,
-			&sr.issue.Description,
-			&sr.issue.Status,
-			&sr.issue.Priority,
-			&sr.issue.AssigneeType,
-			&sr.issue.AssigneeID,
-			&sr.issue.CreatorType,
-			&sr.issue.CreatorID,
-			&sr.issue.ParentIssueID,
-			&sr.issue.AcceptanceCriteria,
-			&sr.issue.ContextRefs,
-			&sr.issue.Position,
-			&sr.issue.StartDate,
-			&sr.issue.DueDate,
-			&sr.issue.CreatedAt,
-			&sr.issue.UpdatedAt,
-			&sr.issue.LastActivityAt,
-			&sr.issue.Number,
-			&sr.issue.ProjectID,
-			&sr.issue.Revision,
-			&sr.issue.DuplicateOfIssueID,
-			&sr.matchSource,
-			&sr.matchedCommentContent,
-		); err != nil {
+		if err := rows.Scan(searchParityDestinations(&sr, projectsNumberCode)...); err != nil {
 			t.Fatalf("scan %s row: %v", label, err)
 		}
 		result = append(result, searchParityRow{
