@@ -37,11 +37,17 @@ const PlatformSkillName = "multica-platform"
 //
 // The scoping exists because a built-in skill costs every agent that receives
 // it: its description sits in the always-loaded skill listing, and its files
-// are written into every task's workdir. Mika's onboarding walkthrough is one
-// agent's procedure, not a platform contract, so shipping it workspace-wide
-// spent that budget on nine agents out of ten that can never use it.
+// are written into every task's workdir. Mika's onboarding walkthrough and its
+// project-management playbooks are one agent's procedures, not platform
+// contracts, so shipping them workspace-wide spent that budget on nine agents
+// out of ten that can never use them.
+//
+// Scoping is how Mika's prompt stays small: the durable role, boundaries, and
+// decision rules live in its always-loaded instructions, while the longer
+// playbooks it consults only when planning or reviewing load on demand.
 var builtinSkillSystemKey = map[string]string{
 	"multica-onboarding": MikaSystemKey,
+	"multica-pm":         MikaSystemKey,
 }
 
 // BuiltinSkills returns the platform's built-in skills for an agent with the
