@@ -102,6 +102,7 @@ Workspace-scoped queries filter by `workspace_id`; membership gates access and `
 ## Web/Desktop UI Rules
 
 - For Button and Dialog usage, read `packages/ui/docs/button.md` and `packages/ui/docs/dialog.md`. These component contracts also power UI Lab documentation.
+- For Web/Desktop UI design, component changes, or interaction previews, start with [UI Lab usage](apps/ui-lab/README.md) for its local preview, scope, and checks. UI Lab previews are not formal product acceptance, and exported style patches require manual integration. Validate real business behavior through the existing project requirements.
 
 - Prefer existing shadcn/Base UI primitives. Add components with `pnpm ui:add <component>`.
 - For `pnpm ui:add @reui/<name>`, decline overwrite prompts. Keep `REUI_LICENSE_KEY` in the environment, never in repo files. Adapt vendored primitives into `packages/ui/components/ui/` and compositions into `packages/views/`.
