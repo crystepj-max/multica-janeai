@@ -38,10 +38,10 @@ const (
 // instructions it is stored on the row: description is an owner-editable field
 // and the product does not reclaim it after creation.
 var mikaAgentDescriptions = map[string]string{
-	"en": "Your workspace Chief of Staff. Mika turns goals into issues, coordinates agents, and helps build reusable workflows.",
-	"zh": "你的工作区 Chief of Staff。Mika 会把目标转化为任务、协调智能体，并帮你建立可复用的工作流。",
-	"ko": "워크스페이스의 Chief of Staff입니다. Mika가 목표를 태스크로 구체화하고 에이전트를 조율하며 재사용 가능한 워크플로 구성을 돕습니다.",
-	"ja": "ワークスペースの Chief of Staff。Mika は目標をタスクに落とし込み、エージェントを調整し、再利用できるワークフローづくりを支援します。",
+	"en": "Your workspace Chief of Staff. Mika turns goals into prioritized, dependency-aware issues, keeps progress and risk visible, and coordinates members and agents.",
+	"zh": "你的工作区 Chief of Staff。Mika 把目标拆成有优先级和依赖关系的任务，持续跟踪进度与风险，并协调成员与智能体推进落地。",
+	"ko": "워크스페이스의 Chief of Staff. Mika는 목표를 우선순위와 의존 관계가 있는 태스크로 나누고, 진행 상황과 리스크를 계속 보이게 하며, 멤버와 에이전트를 조율합니다.",
+	"ja": "ワークスペースの Chief of Staff。Mika は目標を優先順位と依存関係を持つタスクに分解し、進捗とリスクを見える状態に保ち、メンバーとエージェントを調整します。",
 }
 
 type createMikaAgentRequest struct {
