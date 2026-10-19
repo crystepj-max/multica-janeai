@@ -180,7 +180,6 @@ func TestDaemonLifecycleRefusesForeignDaemon(t *testing.T) {
 	}{
 		{"stop", func(c *cobra.Command) error { return runDaemonStop(c, nil) }},
 		{"restart", func(c *cobra.Command) error { return runDaemonRestart(c, nil) }},
-		{"start", func(c *cobra.Command) error { return runDaemonBackground(c) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,6 +201,18 @@ func TestDaemonLifecycleRefusesForeignDaemon(t *testing.T) {
 				t.Fatalf("mismatch = %+v, want got=collide-ab want=collide-ba", mismatch)
 			}
 		})
+	}
+}
+
+func TestDaemonStartCanFallBackFromForeignProfilePort(t *testing.T) {
+	clearDaemonTaskEnv(t)
+	mkProfiles(t, "collide-ab", "collide-ba")
+	serveHealthAs(t, "collide-ab", map[string]any{"profile": "collide-ab"})
+	cmd := daemonStatusCmdFor(t, "collide-ba", "")
+	cmd.Flags().Bool("foreground", false, "")
+	err := runDaemonBackground(cmd)
+	if err == nil || !strings.Contains(err.Error(), "not logged in") {
+		t.Fatalf("start error = %v, want auth check after allowing a fallback port", err)
 	}
 }
 

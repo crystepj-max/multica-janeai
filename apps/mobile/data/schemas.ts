@@ -241,9 +241,7 @@ export const EMPTY_LIST_PROJECT_RESOURCES_RESPONSE: ListProjectResourcesResponse
   total: 0,
 };
 
-// =====================================================
 // Chat (sessions / messages / pending task)
-// =====================================================
 // Lenient on every field that's purely informational (status enum, timestamps,
 // agent/creator ids). `.loose()` so server-added fields pass through. The two
 // fields mobile keys behaviour on — `id` and `chat_session_id` — are required.
@@ -366,9 +364,7 @@ export const TaskMessageListSchema = z.array(TaskMessagePayloadSchema).default([
 
 export const EMPTY_TASK_MESSAGE_LIST: TaskMessagePayload[] = [];
 
-// =====================================================
 // Search (issues + projects)
-// =====================================================
 // Mirrors SearchIssueResult / SearchProjectResult in packages/core/types/api.ts.
 // Web does not currently route search responses through parseWithFallback, so
 // the schemas live mobile-side. Promote to core when web adopts the same
@@ -404,9 +400,7 @@ export const EMPTY_SEARCH_PROJECTS_RESPONSE: SearchProjectsResponse = {
   projects: [],
 };
 
-// =====================================================
 // Agent tasks (per-issue runs, active + history)
-// =====================================================
 // Mirrors AgentTask in packages/core/types/agent.ts. Backend handlers:
 //   GET  /api/issues/{id}/active-task → { tasks: AgentTask[] } (may be empty)
 //   GET  /api/issues/{id}/task-runs   → AgentTask[]
@@ -476,9 +470,7 @@ export interface ActiveTasksResponse {
 export const EMPTY_AGENT_TASK_LIST: AgentTask[] = [];
 export const EMPTY_ACTIVE_TASKS_RESPONSE: ActiveTasksResponse = { tasks: [] };
 
-// =====================================================
 // User / Workspace / Inbox / Member / Agent
-// =====================================================
 // Mobile reads these on every cold start (auth → workspaces → inbox → members
 // → agents form the boot sequence). A schema drift in any of them used to
 // cascade — getMe failure flushed the user, listWorkspaces failure landed the
@@ -497,7 +489,6 @@ export const UserSchema: z.ZodType<User> = z.object({
   avatar_url: z.string().nullable().default(null),
   onboarded_at: z.string().nullable().default(null),
   onboarding_questionnaire: z.record(z.string(), z.unknown()).default({}),
-  starter_content_state: z.string().nullable().default(null),
   language: z.string().nullable().default(null),
   profile_description: z.string().default(""),
   timezone: z.string().nullable().default(null),
@@ -515,7 +506,6 @@ export const EMPTY_USER: User = {
   avatar_url: null,
   onboarded_at: null,
   onboarding_questionnaire: {},
-  starter_content_state: null,
   language: null,
   profile_description: "",
   timezone: null,

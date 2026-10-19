@@ -94,6 +94,69 @@ func TestWakeupConditionFieldValueWakesOnceWhenItHolds(t *testing.T) {
 	}
 }
 
+// Cross-issue conditions have no event hints. Their stored predicates must be
+// checked through ListReadyWakeups, including after an unmet scheduled check.
+func TestWakeupConditionOtherIssueUsesScheduledChecks(t *testing.T) {
+	f, s, issue, agent := conditionFixture(t)
+	ctx := context.Background()
+	workspace := parseTestUUID(t, f.WorkspaceID)
+	other := f.Issue(t, "Waiting for review", testutil.Cols{"status": "in_progress"})
+	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Instruction: "Continue after review",
+		Condition: condition(t, map[string]any{"type": "other_issue", "issue_id": other, "state": "in_review"})})
+	if len(w.EventTypes) != 0 || !w.NextFireAt.Valid {
+		t.Fatalf("poll-only rule: events=%v next_fire_at=%+v", w.EventTypes, w.NextFireAt)
+	}
+	tick := func() db.IssueWakeup {
+		t.Helper()
+		if err := s.TickWorkspaces(ctx, workspace); err != nil {
+			t.Fatal(err)
+		}
+		got, err := f.q.LocklessWakeup(ctx, w.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	got := tick()
+	if !got.Enabled || got.FireCount != 0 || wakeRuns(t, f, w.ID) != 0 {
+		t.Fatalf("unmet condition: enabled=%t fire_count=%d", got.Enabled, got.FireCount)
+	}
+	if !got.NextFireAt.Valid || !got.NextFireAt.Time.After(w.NextFireAt.Time) {
+		t.Fatalf("unmet condition was not scheduled for another check: %+v", got.NextFireAt)
+	}
+	// Hold the next check in the future without sleeping or relying on the
+	// wall-clock poll interval. Changing the watched issue emits no hint here.
+	f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()+interval '1 hour' WHERE id=$1", w.ID)
+	wakeSetStatus(t, f, parseTestUUID(t, other), "in_review")
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
+		t.Fatalf("cross-issue change created %d event hints", n)
+	}
+	if active, err := f.q.HasActiveTaskForIssue(ctx, issue); err != nil || active {
+		t.Fatalf("waiting issue has active work: active=%t err=%v", active, err)
+	}
+	got = tick()
+	if got.FireCount != 0 || wakeRuns(t, f, w.ID) != 0 {
+		t.Fatal("condition fired before its scheduled check")
+	}
+	// Only the persisted due time can make this rule a scheduler candidate.
+	f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1", w.ID)
+	got = tick()
+	if got.Enabled || got.FireCount != 1 || got.LastError.Valid || wakeRuns(t, f, w.ID) != 1 {
+		t.Fatalf("due condition: enabled=%t fire_count=%d last_error=%+v", got.Enabled, got.FireCount, got.LastError)
+	}
+	task, err := f.q.GetAgentTask(ctx, got.LastTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(task.HandoffNote.String, "condition.met") || !strings.Contains(task.HandoffNote.String, other) || !strings.Contains(task.HandoffNote.String, `"status":"in_review"`) {
+		t.Fatalf("cross-issue observation missing from the run: %s", task.HandoffNote.String)
+	}
+	got = tick()
+	if got.FireCount != 1 || wakeRuns(t, f, w.ID) != 1 {
+		t.Fatal("once condition fired again on a repeated scheduler pass")
+	}
+}
+
 func TestWakeupConditionRepeatsOnlyWhenItBecomesTrueAgain(t *testing.T) {
 	f, s, issue, agent := conditionFixture(t)
 	label := f.Insert(t, "issue_label", testutil.Cols{"workspace_id": f.WorkspaceID, "name": "approved", "color": "#123456"})

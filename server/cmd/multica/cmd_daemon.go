@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -557,7 +558,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 
 func runDaemonBackground(cmd *cobra.Command) error {
 	profile := resolveProfile(cmd)
-	healthPort := healthPortForProfile(profile)
+	healthPort := resolveHealthPort(profile)
 
 	// Check if daemon is already running.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -565,21 +566,20 @@ func runDaemonBackground(cmd *cobra.Command) error {
 	health := checkDaemonHealthOnPort(ctx, healthPort)
 	if daemonAlive(health) {
 		// A live daemon on our port that belongs to someone else is a
-		// collision, not an "already running" — starting would fail to bind
-		// and "already running" would send the user looking for a daemon of
-		// theirs that does not exist.
+		// collision. The foreground child can safely use a fallback port.
 		if err := daemonIdentityMismatch(health, profile, healthPort); err != nil {
-			return err
+			fmt.Fprintf(os.Stderr, "Preferred health port %d belongs to another profile; trying a fallback port.\n", healthPort)
+		} else {
+			// Even a no-op start keeps the autostart contract: hint when nothing
+			// is registered, silently refresh an entry Multica owns.
+			syncDaemonAutostart(profile, true)
+			label := "daemon"
+			if profile != "" {
+				label = fmt.Sprintf("daemon [%s]", profile)
+			}
+			pid, _ := health["pid"].(float64)
+			return fmt.Errorf("%s is already running (pid %v). Use 'daemon restart' to restart it", label, int(pid))
 		}
-		// Even a no-op start keeps the autostart contract: hint when nothing
-		// is registered, silently refresh an entry Multica owns.
-		syncDaemonAutostart(profile, true)
-		label := "daemon"
-		if profile != "" {
-			label = fmt.Sprintf("daemon [%s]", profile)
-		}
-		pid, _ := health["pid"].(float64)
-		return fmt.Errorf("%s is already running (pid %v). Use 'daemon restart' to restart it", label, int(pid))
 	}
 
 	if err := requireDaemonAuth(profile); err != nil {
@@ -603,6 +603,9 @@ func runDaemonBackground(cmd *cobra.Command) error {
 	dir := daemonDirForProfile(profile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create daemon directory: %w", err)
+	}
+	if err := waitForDaemonProfileRelease(profile, daemonShutdownLockWait); err != nil {
+		return err
 	}
 
 	// The child (foreground daemon) writes daemon.log itself through a
@@ -697,11 +700,17 @@ func runDaemonBackground(cmd *cobra.Command) error {
 			}, waitErr, profile, resolveDaemonServerURL(cmd, profile))
 		case <-time.After(500 * time.Millisecond):
 		}
+		// The child publishes the port only after it has bound the listener.
+		// Ignore a stale record from a previous daemon, even if its port works.
+		record, ok := readDaemonPortRecord(profile)
+		if !ok || record.PID != pid {
+			continue
+		}
 		hctx, hcancel := context.WithTimeout(context.Background(), 2*time.Second)
-		health = checkDaemonHealthOnPort(hctx, healthPort)
+		health = checkDaemonHealthOnPort(hctx, record.Port)
 		hcancel()
 		lastStatus, _ = health["status"].(string)
-		if lastStatus == "running" {
+		if lastStatus == "running" && health["profile"] == profile && health["pid"] == float64(pid) {
 			started = true
 			break
 		}
@@ -1094,6 +1103,31 @@ func runDaemonForeground(cmd *cobra.Command) error {
 	// Set by the Electron Desktop app when it spawns the CLI so the server
 	// can mark those runtimes as "managed" and hide CLI self-update UI.
 	cfg.LaunchedBy = os.Getenv("MULTICA_LAUNCHED_BY")
+	lock, err := acquireDaemonProfileLock(profile, os.Getenv("MULTICA_DAEMON_HANDOFF") == "1")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	_ = os.Unsetenv("MULTICA_DAEMON_HANDOFF")
+	// An older daemon has no profile lock. A direct --foreground start must
+	// still refuse to launch a second daemon for that same profile.
+	port := resolveHealthPort(profile)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	existing := checkDaemonHealthOnPort(probeCtx, port)
+	probeCancel()
+	if daemonAlive(existing) && daemonIdentityMismatch(existing, profile, port) == nil {
+		return fmt.Errorf("daemon %s is already running or starting", describeProfile(profile))
+	}
+	healthLn, actualPort, err := bindDaemonHealthPort(cfg.HealthPort, net.Listen)
+	if err != nil {
+		return err
+	}
+	defer healthLn.Close()
+	cfg.HealthPort = actualPort
+	if err := publishDaemonPort(profile, daemonPortRecord{Port: actualPort, PID: os.Getpid()}); err != nil {
+		return fmt.Errorf("publish daemon health port: %w", err)
+	}
+	defer removeDaemonPortIfOwned(profile, os.Getpid())
 
 	ctx, stop := notifyShutdownContext(context.Background())
 	defer stop()
@@ -1107,7 +1141,7 @@ func runDaemonForeground(cmd *cobra.Command) error {
 	}
 	defer os.Remove(daemonPIDPathForProfile(profile))
 
-	if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := d.RunWithHealthListener(ctx, healthLn); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
 
@@ -1144,6 +1178,7 @@ func runDaemonForeground(cmd *cobra.Command) error {
 
 		args := buildDaemonStartArgs(cmd)
 		child := exec.Command(restartBin, args...)
+		child.Env = append(os.Environ(), "MULTICA_DAEMON_HANDOFF=1")
 
 		// The successor is a fresh foreground daemon that will open daemon.log
 		// through its own rotating writer; hand it the raw-stderr sink so its
@@ -1169,6 +1204,7 @@ func runDaemonForeground(cmd *cobra.Command) error {
 			// duplicate cleanup here.
 			if isAccessDeniedSpawnErr(err) {
 				child = exec.Command(restartBin, args...)
+				child.Env = append(os.Environ(), "MULTICA_DAEMON_HANDOFF=1")
 				child.Stdout = logFile
 				child.Stderr = logFile
 				child.SysProcAttr = daemonSysProcAttr(false)
@@ -1252,7 +1288,7 @@ func runDaemonRestart(cmd *cobra.Command, args []string) error {
 	if err := requireKnownProfile(profile); err != nil {
 		return err
 	}
-	healthPort := healthPortForProfile(profile)
+	healthPort := resolveHealthPort(profile)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1297,6 +1333,13 @@ func runDaemonRestart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Start fresh.
+	// Foreground restarts do not pass through runDaemonBackground, so they
+	// need the same shutdown wait before their short child lock timeout.
+	if foreground, _ := cmd.Flags().GetBool("foreground"); foreground {
+		if err := waitForDaemonProfileRelease(profile, daemonShutdownLockWait); err != nil {
+			return err
+		}
+	}
 	return runDaemonStart(cmd, args)
 }
 
@@ -1310,7 +1353,7 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	if err := requireKnownProfile(profile); err != nil {
 		return err
 	}
-	healthPort := healthPortForProfile(profile)
+	healthPort := resolveHealthPort(profile)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1482,7 +1525,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 func daemonStatusHealthPort(cmd *cobra.Command) (int, error) {
 	profile := resolveProfile(cmd)
 	if !inDaemonTaskIdentityContext() {
-		return healthPortForProfile(profile), nil
+		return resolveHealthPort(profile), nil
 	}
 	if profile != "" {
 		return 0, fmt.Errorf("daemon status --profile is not available inside a daemon-managed task")
