@@ -814,6 +814,51 @@ func TestOnboardingSkillIsScopedToMika(t *testing.T) {
 	}
 }
 
+// TestPMSkillIsScopedToMika pins the second Mika-only built-in: the project
+// management playbooks.
+//
+// Mika's instructions carry the role, the boundaries, and the decision rules
+// on every run. The longer procedures — decomposition worksheets, stage
+// patterns, snapshots, recovery — would multiply that always-loaded cost for
+// every chat turn, and no other agent can use them, so they live here and load
+// when the moment arrives.
+func TestPMSkillIsScopedToMika(t *testing.T) {
+	const pm = "multica-pm"
+
+	svc := &TaskService{}
+	if named(svc.BuiltinSkills("", false), pm) {
+		t.Errorf("an ordinary agent receives %q; the playbooks are Mika's procedure, not a platform contract", pm)
+	}
+	if !named(svc.BuiltinSkills(MikaSystemKey, false), pm) {
+		t.Errorf("Mika does not receive %q, which its instructions tell it to load", pm)
+	}
+
+	skill, ok := findSkill(t, pm)
+	if !ok {
+		return
+	}
+	fm, _, ok := splitFrontmatter(skill.Content)
+	if !ok {
+		t.Fatalf("%s must lead with a frontmatter block", pm)
+	}
+	if got := strings.TrimSpace(fm["name"]); got != pm {
+		t.Errorf("frontmatter name = %q, want the directory name %q", got, pm)
+	}
+
+	// The description is the only text an agent sees before deciding to open
+	// the skill, so every moment this skill exists for has to be reachable
+	// from it — otherwise the playbook ships and is never loaded.
+	desc := strings.ToLower(fm["description"])
+	for _, trigger := range []string{"decompos", "dependenc", "priority", "progress", "risk", "recover"} {
+		if !strings.Contains(desc, trigger) {
+			t.Errorf("description never mentions %q, so that moment cannot find the skill", trigger)
+		}
+	}
+	if !strings.Contains(desc, "multica-platform") {
+		t.Error("description must send platform mechanics to multica-platform, so the two skills do not compete for the same request")
+	}
+}
+
 // containsUnwrapped matches an anchor against prose that Markdown has hard
 // wrapped. These anchors pin a claim, not a line layout — matching raw bytes
 // made every reflow of a paragraph look like a deleted contract, which trains
