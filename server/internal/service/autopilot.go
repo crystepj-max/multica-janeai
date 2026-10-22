@@ -707,90 +707,54 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	}
 	projectID := currentAutopilot.ProjectID
 
-	if duplicate, found, err := issueguard.LockAndFindRecentAutopilotDuplicate(
-		ctx, qtx, ap.WorkspaceID, ap.ID, projectID, title, autopilotRecentDuplicateWindow,
-	); err != nil {
-		return fmt.Errorf("recent duplicate guard: %w", err)
-	} else if found {
-		return &errDispatchSkipped{reason: "recent duplicate autopilot issue: " + util.UUIDToString(duplicate.ID), code: dispatch.ReasonAlreadyActive}
-	}
-
-	var project *db.Project
-	if projectID.Valid {
-		row, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
-			ID:          projectID,
-			WorkspaceID: ap.WorkspaceID,
-		})
-		if err != nil {
-			return fmt.Errorf("load project: %w", err)
-		}
-		code, err := EnsureProjectCode(ctx, qtx, row)
-		if err != nil {
-			return fmt.Errorf("project code: %w", err)
-		}
-		row.Code = code
-		project = &row
-	}
-
-	issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, project, issueCountPolicy)
+	// Pull-request review identity is the repository and PR number, not the
+	// title. The daily title is the same for every PR, and the agent renames
+	// the issue while a review is still running, so the 60-second title guard
+	// both collapses two PRs and lets a later push create a second task.
+	admission, err := s.admitPullRequestReview(ctx, qtx, currentAutopilot, run)
 	if err != nil {
-		var limitErr *IssueLimitReachedError
-		if errors.As(err, &limitErr) {
-			return &errDispatchSkipped{
-				reason: "workspace has reached its issue limit",
-				code:   dispatch.ReasonIssueLimitReached,
+		return err
+	}
+	if admission.skip != nil {
+		if admission.dirty {
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit pull request review coalesce: %w", err)
 			}
 		}
-		return fmt.Errorf("allocate issue number: %w", err)
+		return admission.skip
 	}
-
-	newPosition, err := issueposition.NextTopPosition(ctx, tx, ap.WorkspaceID, "todo")
-	if err != nil {
-		return fmt.Errorf("get next issue position: %w", err)
-	}
-
-	// Same ghost-snapshot retry as the service Create path: a reused project
-	// code whose old issues still hold (code, number) pairs skips ahead.
-	insertDispatchIssue := func(number int32, numberCode string) (db.Issue, error) {
-		return qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
-			ID:           dbid.NewV7(),
-			WorkspaceID:  ap.WorkspaceID,
-			Title:        title,
-			Description:  description,
-			Status:       "todo",
-			Priority:     "none",
-			AssigneeType: pgtype.Text{String: ap.AssigneeType, Valid: true},
-			AssigneeID:   ap.AssigneeID,
-			// The agent that the autopilot dispatches to is the issue's creator,
-			// not the human who originally configured the autopilot. The latter
-			// is captured separately via origin_type=autopilot + origin_id. For
-			// squad-assigned autopilots, the creator is the resolved leader —
-			// the same agent the issue listener will end up enqueueing.
-			CreatorType:   "agent",
-			CreatorID:     leader.ID,
-			ParentIssueID: pgtype.UUID{},
-			Position:      newPosition,
-			StartDate:     pgtype.Date{},
-			DueDate:       pgtype.Date{},
-			Number:        number,
-			ProjectID:     projectID,
-			NumberCode:    numberCode,
-			OriginType:    pgtype.Text{String: "autopilot", Valid: true},
-			OriginID:      ap.ID,
-		})
-	}
-	// Ghost-snapshot skip-ahead under a savepoint — same as the service
-	// Create path: a failed insert aborts the transaction, so the retry must
-	// roll back to the savepoint before re-allocating.
-	_, serr := tx.Exec(ctx, "SAVEPOINT issue_number_attempt")
-	issue, err := insertDispatchIssue(issueNumber, numberCode)
-	for attempt := 0; err != nil && attempt < 50; attempt++ {
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "uq_issue_workspace_code_number" {
-			break
+	if !admission.handled {
+		if duplicate, found, err := issueguard.LockAndFindRecentAutopilotDuplicate(
+			ctx, qtx, ap.WorkspaceID, ap.ID, projectID, title, autopilotRecentDuplicateWindow,
+		); err != nil {
+			return fmt.Errorf("recent duplicate guard: %w", err)
+		} else if found {
+			return &errDispatchSkipped{reason: "recent duplicate autopilot issue: " + util.UUIDToString(duplicate.ID), code: dispatch.ReasonAlreadyActive}
 		}
-		_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT issue_number_attempt")
-		issueNumber, numberCode, err = AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, project, issueCountPolicy)
+	}
+
+	var issue db.Issue
+	if admission.reuse != nil {
+		issue = *admission.reuse
+	} else {
+		var project *db.Project
+		if projectID.Valid {
+			row, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{
+				ID:          projectID,
+				WorkspaceID: ap.WorkspaceID,
+			})
+			if err != nil {
+				return fmt.Errorf("load project: %w", err)
+			}
+			code, err := EnsureProjectCode(ctx, qtx, row)
+			if err != nil {
+				return fmt.Errorf("project code: %w", err)
+			}
+			row.Code = code
+			project = &row
+		}
+
+		issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, project, issueCountPolicy)
 		if err != nil {
 			var limitErr *IssueLimitReachedError
 			if errors.As(err, &limitErr) {
@@ -801,31 +765,100 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 			}
 			return fmt.Errorf("allocate issue number: %w", err)
 		}
+
+		newPosition, err := issueposition.NextTopPosition(ctx, tx, ap.WorkspaceID, "todo")
+		if err != nil {
+			return fmt.Errorf("get next issue position: %w", err)
+		}
+
+		// Same ghost-snapshot retry as the service Create path: a reused project
+		// code whose old issues still hold (code, number) pairs skips ahead.
+		insertDispatchIssue := func(number int32, numberCode string) (db.Issue, error) {
+			return qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
+				ID:           dbid.NewV7(),
+				WorkspaceID:  ap.WorkspaceID,
+				Title:        title,
+				Description:  description,
+				Status:       "todo",
+				Priority:     "none",
+				AssigneeType: pgtype.Text{String: ap.AssigneeType, Valid: true},
+				AssigneeID:   ap.AssigneeID,
+				// The agent that the autopilot dispatches to is the issue's creator,
+				// not the human who originally configured the autopilot. The latter
+				// is captured separately via origin_type=autopilot + origin_id. For
+				// squad-assigned autopilots, the creator is the resolved leader —
+				// the same agent the issue listener will end up enqueueing.
+				CreatorType:   "agent",
+				CreatorID:     leader.ID,
+				ParentIssueID: pgtype.UUID{},
+				Position:      newPosition,
+				StartDate:     pgtype.Date{},
+				DueDate:       pgtype.Date{},
+				Number:        number,
+				ProjectID:     projectID,
+				NumberCode:    numberCode,
+				OriginType:    pgtype.Text{String: "autopilot", Valid: true},
+				OriginID:      ap.ID,
+			})
+		}
+		// Ghost-snapshot skip-ahead under a savepoint — same as the service
+		// Create path: a failed insert aborts the transaction, so the retry must
+		// roll back to the savepoint before re-allocating.
+		_, serr := tx.Exec(ctx, "SAVEPOINT issue_number_attempt")
 		issue, err = insertDispatchIssue(issueNumber, numberCode)
+		for attempt := 0; err != nil && attempt < 50; attempt++ {
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.ConstraintName != "uq_issue_workspace_code_number" {
+				break
+			}
+			_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT issue_number_attempt")
+			issueNumber, numberCode, err = AllocateIssueNumber(ctx, qtx, ap.WorkspaceID, project, issueCountPolicy)
+			if err != nil {
+				var limitErr *IssueLimitReachedError
+				if errors.As(err, &limitErr) {
+					return &errDispatchSkipped{
+						reason: "workspace has reached its issue limit",
+						code:   dispatch.ReasonIssueLimitReached,
+					}
+				}
+				return fmt.Errorf("allocate issue number: %w", err)
+			}
+			issue, err = insertDispatchIssue(issueNumber, numberCode)
+		}
+		if serr == nil {
+			_, _ = tx.Exec(ctx, "RELEASE SAVEPOINT issue_number_attempt")
+		}
+		if err != nil {
+			return fmt.Errorf("create issue: %w", err)
+		}
+		if admission.handled {
+			if err := stampPullRequestReviewStart(ctx, qtx, issue, admission.signal); err != nil {
+				return err
+			}
+		}
 	}
-	if serr == nil {
-		_, _ = tx.Exec(ctx, "RELEASE SAVEPOINT issue_number_attempt")
-	}
-	if err != nil {
-		return fmt.Errorf("create issue: %w", err)
-	}
+
+	createdNew := admission.reuse == nil
 
 	// Fan out the default subscriber template inside the same tx as the
 	// issue insert, before EventIssueCreated fires — so notification
 	// listeners see the full subscriber set on the first event instead of
 	// racing the listener that would otherwise hydrate the template.
-	templateSubs, err := qtx.ListAutopilotSubscribers(ctx, ap.ID)
-	if err != nil {
-		return fmt.Errorf("list autopilot subscribers: %w", err)
-	}
-	for _, sub := range templateSubs {
-		if _, err := qtx.AddIssueSubscriber(ctx, db.AddIssueSubscriberParams{
-			IssueID:  issue.ID,
-			UserType: sub.UserType,
-			UserID:   sub.UserID,
-			Reason:   "autopilot",
-		}); err != nil {
-			return fmt.Errorf("add autopilot subscriber to issue: %w", err)
+	var templateSubs []db.AutopilotSubscriber
+	if createdNew {
+		templateSubs, err = qtx.ListAutopilotSubscribers(ctx, ap.ID)
+		if err != nil {
+			return fmt.Errorf("list autopilot subscribers: %w", err)
+		}
+		for _, sub := range templateSubs {
+			if _, err := qtx.AddIssueSubscriber(ctx, db.AddIssueSubscriberParams{
+				IssueID:  issue.ID,
+				UserType: sub.UserType,
+				UserID:   sub.UserID,
+				Reason:   "autopilot",
+			}); err != nil {
+				return fmt.Errorf("add autopilot subscriber to issue: %w", err)
+			}
 		}
 	}
 
@@ -849,32 +882,35 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Publish issue:created so the existing event chain fires
-	// (subscriber listeners, activity listeners, notification listeners). For
-	// squad autopilots, this is what triggers shouldEnqueueSquadLeaderOnAssign
-	// → enqueueSquadLeaderTask — no separate squad-routing code needed here.
-	prefix := s.getIssuePrefix(ap.WorkspaceID)
-	s.Bus.Publish(events.Event{
-		Type:        protocol.EventIssueCreated,
-		WorkspaceID: util.UUIDToString(ap.WorkspaceID),
-		ActorType:   "agent",
-		ActorID:     util.UUIDToString(leader.ID),
-		Payload: map[string]any{
-			"issue": IssueToMapResolved(ctx, s.Queries, issue, prefix),
-		},
-	})
-	s.captureIssueCreatedFromAutopilot(ap, run, issue, leader.ID)
+	if createdNew {
+		// Publish issue:created so the existing event chain fires
+		// (subscriber listeners, activity listeners, notification listeners). For
+		// squad autopilots, this is what triggers shouldEnqueueSquadLeaderOnAssign
+		// → enqueueSquadLeaderTask — no separate squad-routing code needed here.
+		// Reusing an open review issue must not publish a second created event.
+		prefix := s.getIssuePrefix(ap.WorkspaceID)
+		s.Bus.Publish(events.Event{
+			Type:        protocol.EventIssueCreated,
+			WorkspaceID: util.UUIDToString(ap.WorkspaceID),
+			ActorType:   "agent",
+			ActorID:     util.UUIDToString(leader.ID),
+			Payload: map[string]any{
+				"issue": IssueToMapResolved(ctx, s.Queries, issue, prefix),
+			},
+		})
+		s.captureIssueCreatedFromAutopilot(ap, run, issue, leader.ID)
 
-	// The issue:created notification listener only handles handler.IssueResponse
-	// payloads and only direct-notifies the assignee + @mentions; subscribers
-	// don't get an inbox at creation time on the manual path because there are
-	// none yet. The autopilot path is different: the template subscribers were
-	// fanned out into issue_subscriber inside the tx above, so they exist at the
-	// moment of creation and OQ3 says they should receive the same subscription
-	// events as reason='manual'. Issue creation is one such event — so write
-	// the inbox rows directly here. Done after commit so a failure here doesn't
-	// roll back the issue itself.
-	s.notifyAutopilotSubscribersOnCreate(ctx, ap, issue, leader.ID, templateSubs)
+		// The issue:created notification listener only handles handler.IssueResponse
+		// payloads and only direct-notifies the assignee + @mentions; subscribers
+		// don't get an inbox at creation time on the manual path because there are
+		// none yet. The autopilot path is different: the template subscribers were
+		// fanned out into issue_subscriber inside the tx above, so they exist at the
+		// moment of creation and OQ3 says they should receive the same subscription
+		// events as reason='manual'. Issue creation is one such event — so write
+		// the inbox rows directly here. Done after commit so a failure here doesn't
+		// roll back the issue itself.
+		s.notifyAutopilotSubscribersOnCreate(ctx, ap, issue, leader.ID, templateSubs)
+	}
 
 	// Enqueue agent task via the existing flow. Squad-assigned autopilots
 	// route to the resolved leader as the executing agent (Path A from
@@ -886,27 +922,8 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	// webhook dispatch has no actor and takes the plain entry points, where the
 	// autopilot-origin issue resolves to the trigger's created_by principal
 	// (MUL-6951). The *ByActor variants are the actor-carrying enqueue methods.
-	if ap.AssigneeType == "squad" {
-		// Fail-closed invocation gate: verify the admission principal (manual
-		// clicker, else the trigger's created_by — see autopilotAdmitInvoke) may
-		// still invoke the leader. Catches configs that predate the save-time
-		// gate, and configs that no longer pass (MUL-3963 / MUL-4525).
-		if !s.autopilotAdmitInvoke(ctx, ap, leader, actorUserID, run.TriggerID) {
-			return fmt.Errorf("not allowed to invoke private squad leader")
-		}
-		if actorUserID.Valid {
-			if _, err := s.TaskSvc.EnqueueTaskForSquadLeaderByActor(ctx, issue, leader.ID, ap.AssigneeID, actorUserID); err != nil {
-				return fmt.Errorf("enqueue squad leader task: %w", err)
-			}
-		} else if _, err := s.TaskSvc.EnqueueTaskForSquadLeader(ctx, issue, leader.ID, ap.AssigneeID, pgtype.UUID{}, OriginDerived); err != nil {
-			return fmt.Errorf("enqueue squad leader task: %w", err)
-		}
-	} else if actorUserID.Valid {
-		if _, err := s.TaskSvc.EnqueueTaskForIssueByActor(ctx, issue, actorUserID); err != nil {
-			return fmt.Errorf("enqueue task for issue: %w", err)
-		}
-	} else if _, err := s.TaskSvc.EnqueueTaskForIssue(ctx, issue); err != nil {
-		return fmt.Errorf("enqueue task for issue: %w", err)
+	if err := s.enqueueAutopilotAssigneeTask(ctx, ap, issue, leader, actorUserID, run.TriggerID); err != nil {
+		return err
 	}
 
 	slog.Info("autopilot dispatched (create_issue)",
@@ -1135,6 +1152,10 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 	if !issue.OriginType.Valid || issue.OriginType.String != "autopilot" {
 		return
 	}
+	// A reused review issue may already be in_review, so this status event is
+	// not the only signal that the previous pass finished. The follow-up also
+	// runs from the task listener; the per-PR lock keeps it to one enqueue.
+	defer s.SchedulePullRequestReviewFollowUp(ctx, issue.ID)
 
 	run, err := s.Queries.GetAutopilotRunByIssue(ctx, issue.ID)
 	if err != nil {
