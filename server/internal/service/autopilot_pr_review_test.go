@@ -95,28 +95,147 @@ func TestParsePullRequestRepoAndNumberShapes(t *testing.T) {
 }
 
 func TestDecidePullRequestAdmission(t *testing.T) {
+	older := time.Date(2026, 10, 22, 6, 49, 0, 0, time.UTC)
+	newer := older.Add(time.Minute)
 	tests := []struct {
 		name       string
 		inFlight   bool
 		last       string
-		pending    string
-		incoming   string
+		inflight   reviewSHA
+		pending    reviewSHA
+		incoming   reviewSHA
 		wantAction prAdmissionAction
 		wantTarget string
+		wantAt     time.Time
 	}{
-		{name: "in flight coalesces", inFlight: true, last: "a", pending: "", incoming: "b", wantAction: prAdmitCoalesce, wantTarget: "b"},
-		{name: "same sha already reviewed", last: "a", incoming: "a", wantAction: prAdmitReviewed, wantTarget: "a"},
-		{name: "same sha with pending starts pending", last: "a", pending: "b", incoming: "a", wantAction: prAdmitStart, wantTarget: "b"},
-		{name: "new sha starts incoming", last: "a", pending: "b", incoming: "c", wantAction: prAdmitStart, wantTarget: "c"},
-		{name: "idle new sha", incoming: "c", wantAction: prAdmitStart, wantTarget: "c"},
+		{
+			name:       "in flight keeps newer pending over older incoming",
+			inFlight:   true,
+			inflight:   reviewSHA{sha: "a", at: older},
+			pending:    reviewSHA{sha: "b", at: newer},
+			incoming:   reviewSHA{sha: "c", at: older},
+			wantAction: prAdmitCoalesce,
+			wantTarget: "b",
+			wantAt:     newer,
+		},
+		{
+			name:       "in flight does not replace newer inflight with older incoming",
+			inFlight:   true,
+			inflight:   reviewSHA{sha: "b", at: newer},
+			incoming:   reviewSHA{sha: "c", at: older},
+			wantAction: prAdmitCoalesce,
+			wantTarget: "b",
+			wantAt:     newer,
+		},
+		{
+			name:       "in flight records newer incoming",
+			inFlight:   true,
+			inflight:   reviewSHA{sha: "a", at: older},
+			incoming:   reviewSHA{sha: "b", at: newer},
+			wantAction: prAdmitCoalesce,
+			wantTarget: "b",
+			wantAt:     newer,
+		},
+		{
+			name:       "same sha already reviewed",
+			last:       "a",
+			incoming:   reviewSHA{sha: "a", at: older},
+			wantAction: prAdmitReviewed,
+			wantTarget: "a",
+			wantAt:     older,
+		},
+		{
+			name:       "pending later than incoming starts pending",
+			last:       "a",
+			pending:    reviewSHA{sha: "b", at: newer},
+			incoming:   reviewSHA{sha: "c", at: older},
+			wantAction: prAdmitStart,
+			wantTarget: "b",
+			wantAt:     newer,
+		},
+		{
+			name:       "incoming later than pending starts incoming",
+			last:       "a",
+			pending:    reviewSHA{sha: "b", at: older},
+			incoming:   reviewSHA{sha: "c", at: newer},
+			wantAction: prAdmitStart,
+			wantTarget: "c",
+			wantAt:     newer,
+		},
+		{
+			name:       "timeless incoming does not replace pending",
+			last:       "a",
+			pending:    reviewSHA{sha: "b"},
+			incoming:   reviewSHA{sha: "c"},
+			wantAction: prAdmitStart,
+			wantTarget: "b",
+		},
+		{
+			name:       "equal time keeps pending over incoming",
+			last:       "a",
+			pending:    reviewSHA{sha: "b", at: older},
+			incoming:   reviewSHA{sha: "c", at: older},
+			wantAction: prAdmitStart,
+			wantTarget: "b",
+			wantAt:     older,
+		},
+		{
+			name:       "unreviewed inflight beats an already reviewed incoming",
+			last:       "a",
+			inflight:   reviewSHA{sha: "b", at: newer},
+			incoming:   reviewSHA{sha: "a", at: older},
+			wantAction: prAdmitStart,
+			wantTarget: "b",
+			wantAt:     newer,
+		},
+		{
+			name:       "idle new sha",
+			incoming:   reviewSHA{sha: "c", at: older},
+			wantAction: prAdmitStart,
+			wantTarget: "c",
+			wantAt:     older,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			action, target := decidePullRequestAdmission(tt.inFlight, tt.last, tt.pending, tt.incoming)
-			if action != tt.wantAction || target != tt.wantTarget {
-				t.Fatalf("got %s %s, want %s %s", action, target, tt.wantAction, tt.wantTarget)
+			action, target := decidePullRequestAdmission(tt.inFlight, tt.last, tt.inflight, tt.pending, tt.incoming)
+			if action != tt.wantAction || target.sha != tt.wantTarget || !target.at.Equal(tt.wantAt) {
+				t.Fatalf("got %s %s %s, want %s %s %s", action, target.sha, target.at, tt.wantAction, tt.wantTarget, tt.wantAt)
 			}
 		})
+	}
+}
+
+func TestShouldRecordCoalescedPending(t *testing.T) {
+	older := time.Date(2026, 10, 22, 6, 49, 0, 0, time.UTC)
+	newer := older.Add(time.Minute)
+	inflight := reviewSHA{sha: "inflight", at: newer}
+	incoming := reviewSHA{sha: "old", at: older}
+	if shouldRecordCoalescedPending(inflight, reviewSHA{}, incoming, inflight) {
+		t.Fatal("older incoming must not overwrite an empty pending while inflight is newer")
+	}
+	latest := reviewSHA{sha: "new", at: newer.Add(time.Minute)}
+	if !shouldRecordCoalescedPending(inflight, reviewSHA{}, latest, latest) {
+		t.Fatal("newer incoming should be recorded")
+	}
+	pending := reviewSHA{sha: "pending", at: newer}
+	if shouldRecordCoalescedPending(inflight, pending, incoming, pending) {
+		t.Fatal("an older incoming must not replace the stored pending")
+	}
+}
+
+func TestPromotedReviewSHAKeepsOriginalArrivalTime(t *testing.T) {
+	older := time.Date(2026, 10, 22, 6, 49, 0, 0, time.UTC)
+	newer := older.Add(time.Minute)
+	got := promotedReviewSHA("reviewed", reviewSHA{sha: "s1", at: older}, reviewSHA{sha: "s2", at: newer})
+	if got.sha != "s2" || !got.at.Equal(newer) {
+		t.Fatalf("promoted = %+v", got)
+	}
+	if got := promotedReviewSHA("reviewed", reviewSHA{sha: "s1", at: newer}, reviewSHA{sha: "s2", at: older}); got.sha != "" {
+		t.Fatalf("older pending was promoted: %+v", got)
+	}
+	if got := promotedReviewSHA("s1", reviewSHA{sha: "s1", at: older}, reviewSHA{}); got.sha != "" {
+		t.Fatalf("reviewed inflight was promoted: %+v", got)
 	}
 }
 
@@ -132,8 +251,17 @@ func TestShouldReplacePending(t *testing.T) {
 	if !shouldReplacePending("old", older, newer) {
 		t.Fatal("newer delivery should replace pending")
 	}
-	if !shouldReplacePending("old", older, time.Time{}) {
-		t.Fatal("missing timestamp should still record the sha")
+	if shouldReplacePending("old", older, time.Time{}) {
+		t.Fatal("missing timestamp must not replace a known time")
+	}
+	if shouldReplacePending("old", time.Time{}, time.Time{}) {
+		t.Fatal("two missing timestamps must keep the stored sha")
+	}
+	if !shouldReplacePending("old", time.Time{}, newer) {
+		t.Fatal("a known incoming time should fill a missing stored time")
+	}
+	if shouldReplacePending("old", older, older) {
+		t.Fatal("equal timestamps must keep the stored sha")
 	}
 }
 

@@ -33,6 +33,7 @@ const (
 	metaReviewRepo      = "review_repo"
 	metaReviewPR        = "review_pr"
 	metaInflightSHA     = "inflight_sha"
+	metaInflightAt      = "inflight_at"
 	metaPendingSHA      = "pending_sha"
 	metaPendingAt       = "pending_at"
 	metaLastReviewedSHA = "last_reviewed_sha"
@@ -113,11 +114,13 @@ func (s *AutopilotService) admitPullRequestReview(ctx context.Context, q *db.Que
 		return pullRequestAdmission{}, err
 	}
 	lastReviewed := issueMetadataString(existing.Metadata, metaLastReviewedSHA)
-	pending := issueMetadataString(existing.Metadata, metaPendingSHA)
-	action, target := decidePullRequestAdmission(inFlight, lastReviewed, pending, signal.SHA)
+	inflight := loadReviewSHA(existing.Metadata, metaInflightSHA, metaInflightAt)
+	pending := loadReviewSHA(existing.Metadata, metaPendingSHA, metaPendingAt)
+	incoming := (reviewSHA{sha: signal.SHA, at: signal.At}).normalized()
+	action, best := decidePullRequestAdmission(inFlight, lastReviewed, inflight, pending, incoming)
 	switch action {
 	case prAdmitCoalesce:
-		if !shouldReplacePending(pending, parseMetadataTime(issueMetadataString(existing.Metadata, metaPendingAt)), signal.At) {
+		if !shouldRecordCoalescedPending(inflight, pending, incoming, best) {
 			return pullRequestAdmission{
 				handled: true,
 				skip: &errDispatchSkipped{
@@ -126,14 +129,10 @@ func (s *AutopilotService) admitPullRequestReview(ctx context.Context, q *db.Que
 				},
 			}, nil
 		}
-		if err := setIssueMetadataString(ctx, q, existing, metaPendingSHA, signal.SHA); err != nil {
+		if err := setIssueMetadataString(ctx, q, existing, metaPendingSHA, best.sha); err != nil {
 			return pullRequestAdmission{}, err
 		}
-		pendingAt := signal.At
-		if pendingAt.IsZero() {
-			pendingAt = time.Now().UTC()
-		}
-		if err := setIssueMetadataString(ctx, q, existing, metaPendingAt, pendingAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := setOrDeleteIssueMetadataTime(ctx, q, existing, metaPendingAt, best.at); err != nil {
 			return pullRequestAdmission{}, err
 		}
 		return pullRequestAdmission{
@@ -154,7 +153,8 @@ func (s *AutopilotService) admitPullRequestReview(ctx context.Context, q *db.Que
 		}, nil
 	default:
 		start := signal
-		start.SHA = target
+		start.SHA = best.sha
+		start.At = best.at
 		if err := stampPullRequestReviewStart(ctx, q, existing, start); err != nil {
 			return pullRequestAdmission{}, err
 		}
@@ -174,30 +174,145 @@ func pullRequestReviewLockKey(workspaceID, autopilotID pgtype.UUID, repo, number
 	return "autopilot-pr-review|" + util.UUIDToString(workspaceID) + "|" + util.UUIDToString(autopilotID) + "|" + strings.ToLower(strings.TrimSpace(repo)) + "|" + strings.TrimSpace(number)
 }
 
+// reviewSHA is one commit held in the review record and the arrival time of
+// that delivery. A zero time means the arrival time was not stored. It is not
+// the claim lease.
+type reviewSHA struct {
+	sha string
+	at  time.Time
+}
+
+func (s reviewSHA) normalized() reviewSHA {
+	s.sha = strings.TrimSpace(s.sha)
+	if s.sha == "" {
+		return reviewSHA{}
+	}
+	if !s.at.IsZero() {
+		s.at = s.at.UTC()
+	}
+	return s
+}
+
+func unreviewedSHA(sha, lastReviewed string, at time.Time) reviewSHA {
+	value := (reviewSHA{sha: sha, at: at}).normalized()
+	if value.sha == "" || value.sha == strings.TrimSpace(lastReviewed) {
+		return reviewSHA{}
+	}
+	return value
+}
+
+// laterReviewSHA keeps the newer unreviewed commit.
+// Equal times keep the candidate already stored. A missing time loses to a
+// known time. When both times are missing, the stored candidate stays.
+// The same commit keeps the later known arrival time.
+func laterReviewSHA(kept, next reviewSHA) reviewSHA {
+	kept = kept.normalized()
+	next = next.normalized()
+	if next.sha == "" {
+		return kept
+	}
+	if kept.sha == "" {
+		return next
+	}
+	if kept.sha == next.sha {
+		if kept.at.IsZero() || (!next.at.IsZero() && next.at.After(kept.at)) {
+			return next
+		}
+		return kept
+	}
+	switch {
+	case !kept.at.IsZero() && !next.at.IsZero():
+		if next.at.After(kept.at) {
+			return next
+		}
+		return kept
+	case !kept.at.IsZero():
+		return kept
+	case !next.at.IsZero():
+		return next
+	default:
+		return kept
+	}
+}
+
+func loadReviewSHA(metadata []byte, shaKey, atKey string) reviewSHA {
+	return (reviewSHA{
+		sha: issueMetadataString(metadata, shaKey),
+		at:  parseMetadataTime(issueMetadataString(metadata, atKey)),
+	}).normalized()
+}
+
+// chooseUnreviewedSHA folds inflight, then pending, then incoming.
+// An earlier candidate wins when the arrival times are equal.
+func chooseUnreviewedSHA(lastReviewed string, inflight, pending, incoming reviewSHA) reviewSHA {
+	best := laterReviewSHA(
+		unreviewedSHA(inflight.sha, lastReviewed, inflight.at),
+		unreviewedSHA(pending.sha, lastReviewed, pending.at),
+	)
+	return laterReviewSHA(best, unreviewedSHA(incoming.sha, lastReviewed, incoming.at))
+}
+
+// promotedReviewSHA is the pending commit a finished review should claim.
+// An empty result means pending is missing, already reviewed, or not newer
+// than inflight. The returned time is that commit's own arrival time.
+func promotedReviewSHA(lastReviewed string, inflight, pending reviewSHA) reviewSHA {
+	inflight = inflight.normalized()
+	best := laterReviewSHA(
+		unreviewedSHA(inflight.sha, lastReviewed, inflight.at),
+		unreviewedSHA(pending.sha, lastReviewed, pending.at),
+	)
+	if best.sha == "" || best.sha == inflight.sha {
+		return reviewSHA{}
+	}
+	return best
+}
+
 // decidePullRequestAdmission picks what one delivery does once the per-PR lock
 // is held. inFlight is a running task or linked run, not an open issue: a
 // review can sit in_review waiting for merge and still accept a new commit.
-func decidePullRequestAdmission(inFlight bool, lastReviewed, pending, incoming string) (prAdmissionAction, string) {
+// The returned commit is the newest unreviewed candidate. Its time belongs to
+// that candidate, not to a losing delivery.
+func decidePullRequestAdmission(inFlight bool, lastReviewed string, inflight, pending, incoming reviewSHA) (prAdmissionAction, reviewSHA) {
+	best := chooseUnreviewedSHA(lastReviewed, inflight, pending, incoming)
 	if inFlight {
-		return prAdmitCoalesce, incoming
+		return prAdmitCoalesce, best
 	}
-	if incoming == lastReviewed && pending != "" && pending != lastReviewed {
-		return prAdmitStart, pending
+	if best.sha == "" {
+		return prAdmitReviewed, incoming.normalized()
 	}
-	if incoming == lastReviewed {
-		return prAdmitReviewed, incoming
-	}
-	return prAdmitStart, incoming
+	return prAdmitStart, best
 }
 
+// shouldReplacePending reports whether an incoming delivery may replace the
+// stored pending commit. A missing time never erases a known time. When both
+// times are missing, the stored commit stays. Equal times keep the stored one.
 func shouldReplacePending(existingSHA string, existingAt, incomingAt time.Time) bool {
 	if strings.TrimSpace(existingSHA) == "" {
 		return true
 	}
-	if incomingAt.IsZero() || existingAt.IsZero() {
+	switch {
+	case !existingAt.IsZero() && !incomingAt.IsZero():
+		return incomingAt.After(existingAt)
+	case !existingAt.IsZero():
+		return false
+	case !incomingAt.IsZero():
 		return true
+	default:
+		return false
 	}
-	return !incomingAt.Before(existingAt)
+}
+
+// shouldRecordCoalescedPending writes pending only when this delivery is the
+// newest unreviewed commit and it is not already the inflight commit.
+func shouldRecordCoalescedPending(inflight, pending, incoming, best reviewSHA) bool {
+	best = best.normalized()
+	incoming = incoming.normalized()
+	inflight = inflight.normalized()
+	pending = pending.normalized()
+	if best.sha == "" || best.sha != incoming.sha || best.sha == inflight.sha {
+		return false
+	}
+	return shouldReplacePending(pending.sha, pending.at, best.at)
 }
 
 func stampPullRequestReviewStart(ctx context.Context, q *db.Queries, issue db.Issue, signal pullRequestReviewSignal) error {
@@ -208,6 +323,9 @@ func stampPullRequestReviewStart(ctx context.Context, q *db.Queries, issue db.Is
 		return err
 	}
 	if err := setIssueMetadataString(ctx, q, issue, metaInflightSHA, signal.SHA); err != nil {
+		return err
+	}
+	if err := setOrDeleteIssueMetadataTime(ctx, q, issue, metaInflightAt, signal.At); err != nil {
 		return err
 	}
 	if err := deleteIssueMetadataKey(ctx, q, issue, metaPendingSHA); err != nil {
@@ -321,12 +439,17 @@ func (s *AutopilotService) schedulePullRequestReviewFollowUp(ctx context.Context
 	if err != nil {
 		return err
 	}
-	pending := issueMetadataString(issue.Metadata, metaPendingSHA)
-	inflight := issueMetadataString(issue.Metadata, metaInflightSHA)
-	var followUpSHA string
-	if !terminal && pending != "" && pending != inflight {
-		followUpSHA = pending
-		if err := setIssueMetadataString(ctx, qtx, issue, metaInflightSHA, pending); err != nil {
+	lastReviewed := issueMetadataString(issue.Metadata, metaLastReviewedSHA)
+	inflight := loadReviewSHA(issue.Metadata, metaInflightSHA, metaInflightAt)
+	pending := loadReviewSHA(issue.Metadata, metaPendingSHA, metaPendingAt)
+	followUp := promotedReviewSHA(lastReviewed, inflight, pending)
+	if !terminal && followUp.sha != "" {
+		// Read pending_at before deleting it. inflight_at keeps that arrival
+		// time; review_claim_at is only the lease.
+		if err := setIssueMetadataString(ctx, qtx, issue, metaInflightSHA, followUp.sha); err != nil {
+			return err
+		}
+		if err := setOrDeleteIssueMetadataTime(ctx, qtx, issue, metaInflightAt, followUp.at); err != nil {
 			return err
 		}
 		if err := deleteIssueMetadataKey(ctx, qtx, issue, metaPendingSHA); err != nil {
@@ -338,7 +461,7 @@ func (s *AutopilotService) schedulePullRequestReviewFollowUp(ctx context.Context
 		if err := setIssueMetadataString(ctx, qtx, issue, metaReviewClaimAt, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
-	} else if pending != "" && pending == inflight {
+	} else if pending.sha != "" && followUp.sha == "" {
 		if err := deleteIssueMetadataKey(ctx, qtx, issue, metaPendingSHA); err != nil {
 			return err
 		}
@@ -355,11 +478,11 @@ func (s *AutopilotService) schedulePullRequestReviewFollowUp(ctx context.Context
 			s.publishRunDone(util.UUIDToString(issue.WorkspaceID), *completed, "completed")
 		}
 	}
-	if followUpSHA == "" {
+	if followUp.sha == "" || terminal {
 		return nil
 	}
 	if err := s.enqueuePullRequestReviewFollowUp(ctx, issue); err != nil {
-		s.restorePullRequestReviewClaim(ctx, issue.ID, inflight, followUpSHA)
+		s.restorePullRequestReviewClaim(ctx, issue.ID, inflight, followUp)
 		return err
 	}
 	s.clearPullRequestReviewClaim(ctx, issue.ID)
@@ -367,7 +490,7 @@ func (s *AutopilotService) schedulePullRequestReviewFollowUp(ctx context.Context
 		"issue_id", util.UUIDToString(issue.ID),
 		"repo", repo,
 		"pr", number,
-		"sha", followUpSHA,
+		"sha", followUp.sha,
 	)
 	return nil
 }
@@ -399,32 +522,75 @@ func (s *AutopilotService) clearPullRequestReviewClaim(ctx context.Context, issu
 	}
 }
 
-// restorePullRequestReviewClaim puts the sha back when enqueue failed, without
-// overwriting a newer pending sha recorded by a webhook during the gap.
-func (s *AutopilotService) restorePullRequestReviewClaim(ctx context.Context, issueID pgtype.UUID, previousInflight, target string) {
+// restorePullRequestReviewClaim puts the claimed commit back when enqueue
+// failed. previous and claimed must come from the claim that just committed.
+// Arrival times are the original ones, not the time of this restore.
+func (s *AutopilotService) restorePullRequestReviewClaim(ctx context.Context, issueID pgtype.UUID, previous, claimed reviewSHA) {
 	if err := s.withPullRequestReviewLock(ctx, issueID, func(q *db.Queries, issue db.Issue) error {
-		pending := issueMetadataString(issue.Metadata, metaPendingSHA)
-		if pending == "" || pending == target {
-			if err := setIssueMetadataString(ctx, q, issue, metaPendingSHA, target); err != nil {
-				return err
-			}
-			if err := setIssueMetadataString(ctx, q, issue, metaPendingAt, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-				return err
-			}
-		}
-		if issueMetadataString(issue.Metadata, metaInflightSHA) == target {
-			if previousInflight == "" {
-				if err := deleteIssueMetadataKey(ctx, q, issue, metaInflightSHA); err != nil {
-					return err
-				}
-			} else if err := setIssueMetadataString(ctx, q, issue, metaInflightSHA, previousInflight); err != nil {
-				return err
-			}
-		}
-		return deleteIssueMetadataKey(ctx, q, issue, metaReviewClaimAt)
+		return restorePullRequestReviewAfterEnqueueFailure(ctx, q, issue, previous, claimed)
 	}); err != nil {
 		slog.Warn("restore pull request review claim failed", "issue_id", util.UUIDToString(issueID), "error", err)
 	}
+}
+
+func restorePullRequestReviewAfterEnqueueFailure(ctx context.Context, q *db.Queries, issue db.Issue, previous, claimed reviewSHA) error {
+	claimed = claimed.normalized()
+	previous = previous.normalized()
+	if claimed.sha == "" {
+		return fmt.Errorf("restore pull request review claim: empty claimed sha")
+	}
+	currentPending := loadReviewSHA(issue.Metadata, metaPendingSHA, metaPendingAt)
+	currentInflight := loadReviewSHA(issue.Metadata, metaInflightSHA, metaInflightAt)
+	if currentInflight.sha != claimed.sha {
+		// Another writer owns inflight. Leave it and its claim lease alone.
+		candidate := laterReviewSHA(currentPending, claimed)
+		newer := laterReviewSHA(currentInflight, candidate)
+		if candidate.sha == "" || candidate.sha == currentInflight.sha || newer.sha != candidate.sha {
+			return nil
+		}
+		if err := setIssueMetadataString(ctx, q, issue, metaPendingSHA, candidate.sha); err != nil {
+			return err
+		}
+		return setOrDeleteIssueMetadataTime(ctx, q, issue, metaPendingAt, candidate.at)
+	}
+
+	newest := laterReviewSHA(currentPending, claimed)
+	restored := previous
+	if newest.sha == restored.sha && !newest.at.IsZero() && (restored.at.IsZero() || newest.at.After(restored.at)) {
+		restored.at = newest.at
+	}
+	if newest.sha != "" && newest.sha != restored.sha {
+		if err := setIssueMetadataString(ctx, q, issue, metaPendingSHA, newest.sha); err != nil {
+			return err
+		}
+		if err := setOrDeleteIssueMetadataTime(ctx, q, issue, metaPendingAt, newest.at); err != nil {
+			return err
+		}
+	}
+	if restored.sha == "" {
+		if err := deleteIssueMetadataKey(ctx, q, issue, metaInflightSHA); err != nil {
+			return err
+		}
+		if err := deleteIssueMetadataKey(ctx, q, issue, metaInflightAt); err != nil {
+			return err
+		}
+	} else {
+		if err := setIssueMetadataString(ctx, q, issue, metaInflightSHA, restored.sha); err != nil {
+			return err
+		}
+		if err := setOrDeleteIssueMetadataTime(ctx, q, issue, metaInflightAt, restored.at); err != nil {
+			return err
+		}
+	}
+	if newest.sha == "" || newest.sha == restored.sha {
+		if err := deleteIssueMetadataKey(ctx, q, issue, metaPendingSHA); err != nil {
+			return err
+		}
+		if err := deleteIssueMetadataKey(ctx, q, issue, metaPendingAt); err != nil {
+			return err
+		}
+	}
+	return deleteIssueMetadataKey(ctx, q, issue, metaReviewClaimAt)
 }
 
 func (s *AutopilotService) releaseStuckPullRequestReviewRun(ctx context.Context, issueID pgtype.UUID) {
@@ -521,6 +687,13 @@ func issueHasTerminalStatus(ctx context.Context, q *db.Queries, issue db.Issue) 
 		}
 	}
 	return false, nil
+}
+
+func setOrDeleteIssueMetadataTime(ctx context.Context, q *db.Queries, issue db.Issue, key string, at time.Time) error {
+	if at.IsZero() {
+		return deleteIssueMetadataKey(ctx, q, issue, key)
+	}
+	return setIssueMetadataString(ctx, q, issue, key, at.UTC().Format(time.RFC3339Nano))
 }
 
 func setIssueMetadataString(ctx context.Context, q *db.Queries, issue db.Issue, key, value string) error {
