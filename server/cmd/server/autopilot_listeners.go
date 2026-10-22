@@ -78,9 +78,10 @@ func syncRunFromTaskEvent(ctx context.Context, svc *service.AutopilotService, e 
 	}
 	if task.AutopilotRunID.Valid {
 		svc.SyncRunFromTask(ctx, task)
-		return
-	}
-	if e.Type == protocol.EventTaskFailed {
+	} else if e.Type == protocol.EventTaskFailed {
 		svc.SyncRunFromLinkedIssueTask(ctx, task)
+	}
+	if task.IssueID.Valid && (task.Status == "completed" || task.Status == "failed" || task.Status == "cancelled") {
+		svc.SchedulePullRequestReviewFollowUp(ctx, task.IssueID)
 	}
 }
