@@ -723,6 +723,79 @@ func (q *Queries) FindActiveDuplicateIssue(ctx context.Context, arg FindActiveDu
 	return i, err
 }
 
+const findOpenPullRequestReviewIssue = `-- name: FindOpenPullRequestReviewIssue :one
+SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id, i.number_code FROM issue i
+WHERE i.workspace_id = $1
+  AND NOT (i.status = ANY($3::text[]))
+  AND i.triage_state IS NULL
+  AND i.origin_type = 'autopilot'
+  AND i.origin_id = $2
+  AND i.project_id IS NOT DISTINCT FROM $4::uuid
+  AND i.parent_issue_id IS NULL
+  AND lower(i.metadata ->> 'review_repo') = lower($5::text)
+  AND i.metadata ->> 'review_pr' = $6::text
+ORDER BY i.created_at ASC
+LIMIT 1
+`
+
+type FindOpenPullRequestReviewIssueParams struct {
+	WorkspaceID        pgtype.UUID `json:"workspace_id"`
+	OriginID           pgtype.UUID `json:"origin_id"`
+	TerminalStatusKeys []string    `json:"terminal_status_keys"`
+	ProjectID          pgtype.UUID `json:"project_id"`
+	ReviewRepo         string      `json:"review_repo"`
+	ReviewPr           string      `json:"review_pr"`
+}
+
+// One open review task per autopilot, repository, and pull request. Title is
+// not part of the identity: the review agent renames the issue while it runs,
+// and a 60-second title window cannot cover a review that is still in flight.
+func (q *Queries) FindOpenPullRequestReviewIssue(ctx context.Context, arg FindOpenPullRequestReviewIssueParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, findOpenPullRequestReviewIssue,
+		arg.WorkspaceID,
+		arg.OriginID,
+		arg.TerminalStatusKeys,
+		arg.ProjectID,
+		arg.ReviewRepo,
+		arg.ReviewPr,
+	)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Title,
+		&i.Description,
+		&i.Status,
+		&i.Priority,
+		&i.AssigneeType,
+		&i.AssigneeID,
+		&i.CreatorType,
+		&i.CreatorID,
+		&i.ParentIssueID,
+		&i.AcceptanceCriteria,
+		&i.ContextRefs,
+		&i.Position,
+		&i.DueDate,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Number,
+		&i.ProjectID,
+		&i.OriginType,
+		&i.OriginID,
+		&i.FirstExecutedAt,
+		&i.StartDate,
+		&i.Metadata,
+		&i.Stage,
+		&i.Properties,
+		&i.Revision,
+		&i.LastActivityAt,
+		&i.TriageState,
+		&i.DuplicateOfIssueID,
+		&i.NumberCode,
+	)
+	return i, err
+}
+
 const findRecentAutopilotDuplicateIssue = `-- name: FindRecentAutopilotDuplicateIssue :one
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage, i.properties, i.revision, i.last_activity_at, i.triage_state, i.duplicate_of_issue_id, i.number_code FROM issue i
 WHERE i.workspace_id = $1

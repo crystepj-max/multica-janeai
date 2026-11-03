@@ -471,6 +471,23 @@ WHERE i.workspace_id = $1
 ORDER BY i.created_at ASC
 LIMIT 1;
 
+-- name: FindOpenPullRequestReviewIssue :one
+-- One open review task per autopilot, repository, and pull request. Title is
+-- not part of the identity: the review agent renames the issue while it runs,
+-- and a 60-second title window cannot cover a review that is still in flight.
+SELECT i.* FROM issue i
+WHERE i.workspace_id = $1
+  AND NOT (i.status = ANY(sqlc.arg('terminal_status_keys')::text[]))
+  AND i.triage_state IS NULL
+  AND i.origin_type = 'autopilot'
+  AND i.origin_id = $2
+  AND i.project_id IS NOT DISTINCT FROM sqlc.arg('project_id')::uuid
+  AND i.parent_issue_id IS NULL
+  AND lower(i.metadata ->> 'review_repo') = lower(sqlc.arg('review_repo')::text)
+  AND i.metadata ->> 'review_pr' = sqlc.arg('review_pr')::text
+ORDER BY i.created_at ASC
+LIMIT 1;
+
 -- name: DeleteIssue :exec
 -- Defense-in-depth: the workspace_id predicate makes the tenant invariant a
 -- SQL-layer guarantee rather than a handler-layer one. Handler loaders
