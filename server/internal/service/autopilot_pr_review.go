@@ -606,7 +606,7 @@ func (s *AutopilotService) releaseStuckPullRequestReviewRun(ctx context.Context,
 	if err != nil {
 		return
 	}
-	updated, err := s.completeAutopilotRun(ctx, db.UpdateAutopilotRunCompletedParams{ID: run.ID})
+	updated, err := s.completeAutopilotRun(ctx, autopilotRunCompletion{ID: run.ID})
 	if err != nil {
 		slog.Warn("release stuck pull request review run failed", "issue_id", util.UUIDToString(issueID), "error", err)
 		return

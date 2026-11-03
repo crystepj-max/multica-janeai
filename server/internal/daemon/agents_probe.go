@@ -327,6 +327,9 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 	if e, ok := probe("MULTICA_MUSE_PATH", "muse", "MULTICA_MUSE_MODEL"); ok {
 		agents["muse"] = e
 	}
+	if e, ok := probe("MULTICA_DEVIN_PATH", "devin", "MULTICA_DEVIN_MODEL"); ok {
+		agents["devin"] = e
+	}
 	// Qoder CLI ships as the `qodercli` binary (Qoder Desktop does not put it
 	// on PATH; users install it separately, often via an npm global prefix).
 	// It must go through probe() like every other provider so the login-shell
@@ -389,15 +392,18 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 	if e, ok := probe("MULTICA_ZEROCLAW_PATH", "zeroclaw", ""); ok {
 		agents["zeroclaw"] = e
 	}
-	// ZCode (`zcode`) is the CLI bundled with the ZCode Desktop app, driven
-	// headlessly via the native `zcode app-server` JSON-RPC session protocol
-	// (see server/pkg/agent/zcode_appserver.go). Discovery probes any zcode
-	// the same way as every other CLI (PATH lookup + --version). It takes no
-	// model env var: the catalog comes from the runtime's personal provider
-	// store (see discoverZcodeRuntimeModels), and a pinned agent model is
-	// applied via session/setModel.
-	if e, ok := probe("MULTICA_ZCODE_PATH", "zcode", ""); ok {
+	if e, ok := probe("MULTICA_ZCODE_PATH", "zcode", "MULTICA_ZCODE_MODEL"); ok {
 		agents["zcode"] = e
+	} else if strings.TrimSpace(os.Getenv("MULTICA_ZCODE_PATH")) == "" {
+		for _, candidate := range zcodeDesktopAppBundlePaths() {
+			if executableCandidate(candidate) {
+				agents["zcode"] = AgentEntry{
+					Path: candidate, Command: "zcode",
+					Model: os.Getenv("MULTICA_ZCODE_MODEL"),
+				}
+				break
+			}
+		}
 	}
 	return agents
 }
@@ -451,9 +457,11 @@ type dshProbeVerdict int
 const (
 	// dshProbeOK: the profile answered with the protocol version this backend drives.
 	dshProbeOK dshProbeVerdict = iota
-	// dshProbeMissingProfile: the probe ran and no profile manifest is present,
-	// which is the same fact DSH itself checks before refusing to boot. This is
-	// the only verdict that may install a bundle or condemn the runtime.
+	// A configured bridge must be migrated manually, never provisioned over.
+	dshProbeNeedsMigration
+	// dshProbeMissingProfile: the manifest does not name the Multica runtime.
+	// A file that merely exists is not enough — a refused install leaves one.
+	// This is the only verdict that may install a bundle.
 	dshProbeMissingProfile
 	// dshProbeIncompatible: something answered, with a protocol this daemon does
 	// not drive. The profile is installed, so installing over it would replace a
@@ -473,10 +481,10 @@ const (
 // cost is paid only by a probe that has nothing to say, and it stays well
 // inside the daemon's own 45s startup window.
 //
-// A missing profile does spend the whole budget here: DSH does not refuse the
-// probe, it hangs. That is bounded by construction — the state ends the moment
-// someone installs the profile — and the verdict below no longer depends on
-// telling that hang apart from a busy machine.
+// A manifest that does not name the runtime returns before this budget.
+// Probing that state hangs, and the manifest is enough to call it missing.
+// The budget is spent only when a manifest that does name the runtime
+// produces no frame.
 //
 // A var so tests can shrink it instead of waiting out a real timeout.
 var dshProbeTimeout = 15 * time.Second
@@ -502,6 +510,21 @@ func parseDshProbeFrame(output string) (dshProbeFrame, bool) {
 // whole DSH process, and a round abandoned by a shutting-down daemon should not
 // go on holding one for the rest of the timeout — once per retry, per provider.
 func probeDshMulticaProfile(ctx context.Context, executablePath string) dshProbeVerdict {
+	// A cancelled round says nothing about the profile, and it must be decided
+	// before the manifest: a shutdown is not evidence the profile is missing.
+	if ctx.Err() != nil {
+		return dshProbeUnavailable
+	}
+	if dshMulticaProfileNeedsMigration() {
+		return dshProbeNeedsMigration
+	}
+	// A manifest that does not name the runtime is missing. Decide that before
+	// starting dsh: on current DSH, --probe against the skeleton a refused
+	// install leaves hangs until this timeout, and the file is already the answer.
+	if !dshMulticaProfilePresent() {
+		return dshProbeMissingProfile
+	}
+
 	parent := ctx
 	ctx, cancel := context.WithTimeout(parent, dshProbeTimeout)
 	defer cancel()

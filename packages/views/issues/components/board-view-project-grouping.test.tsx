@@ -217,7 +217,6 @@ describe("Board grouped by project", () => {
           <BoardView
             issues={issues}
             visibleStatuses={["todo"]}
-            hiddenStatuses={[]}
             onMoveIssue={() => {}}
             projectMap={
               new Map([[ACME_ID, makeProject(ACME_ID, "Acme Corp", "🚀")]])

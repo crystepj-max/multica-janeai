@@ -334,9 +334,6 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	var workflowID pgtype.UUID
 	if req.WorkflowID != nil && *req.WorkflowID != "" {
-		if !h.requireProjectWorkflowsV1(w, r) {
-			return
-		}
 		id, ok := parseUUIDOrBadRequest(w, *req.WorkflowID, "workflow_id")
 		if !ok {
 			return
@@ -411,7 +408,7 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 			// run — caught only later, by the claim gate cancelling the task.
 			// It writes its own 422; it runs before the transaction, so a
 			// rejection leaves nothing behind.
-			if !h.requireWorktreeCapableDaemon(w, r, wsUUID, res.ResourceType, ref) {
+			if !requireWorktreeCapableDaemon(w, r, h.Queries, wsUUID, res.ResourceType, ref) {
 				return
 			}
 		}
