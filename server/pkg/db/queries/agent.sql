@@ -34,6 +34,15 @@ SELECT * FROM agent
 WHERE id = $1
 FOR UPDATE;
 
+-- name: LockAgentForTaskEnqueue :one
+-- Retry INSERTs resolve their route in a subsequent statement, so lock before
+-- that statement takes its snapshot. The workspace fence keeps the lock order
+-- compatible with teardown. UpdateAgent waits for this lock before sweeping
+-- queued/deferred rows; claims still enforce the current binding.
+SELECT a.id FROM agent a
+WHERE a.id = $1 AND lock_task_owner_rows(a.id, NULL, NULL)
+FOR KEY SHARE OF a;
+
 -- name: GetAgentInWorkspace :one
 SELECT * FROM agent
 WHERE id = $1 AND workspace_id = $2 AND kind = 'user';
@@ -339,15 +348,29 @@ LIMIT @page_limit;
 -- COALESCE keeps the column's gen_random_uuid() default reachable, so a caller
 -- that passes no id still inserts — it just gets a random v4, exactly as before.
 -- The same pattern is used by every INSERT listed in pkg/dbid's write table.
+-- Workflow handoffs pass their original step and source revision explicitly.
+-- A fire_at value admits a durable deferred task outside the pending slot;
+-- existing callers omit it and continue to insert queued tasks.
+-- Lock the selected agent tuple so a rebind that commits during the owner-fence
+-- wait refreshes the runtime used by INSERT. Materialize that locked route once.
+WITH enqueue_agent AS MATERIALIZED (
+    SELECT a.id, COALESCE(a.runtime_id, sqlc.narg(runtime_id)::uuid) AS runtime_id
+    FROM agent a
+    WHERE a.id = sqlc.arg(agent_id)
+      AND lock_task_owner_rows(a.id, sqlc.narg(issue_id), COALESCE(a.runtime_id, sqlc.narg(runtime_id)::uuid))
+    FOR KEY SHARE OF a
+)
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id,
-    dispatch_issue_revision, workflow_step, id
+    dispatch_issue_revision, workflow_step, fire_at, id
 )
 SELECT
-    $1, $2, $3, 'queued', $4, sqlc.narg(trigger_comment_id),
+    sqlc.arg(agent_id), enqueue_agent.runtime_id, sqlc.narg(issue_id),
+    CASE WHEN sqlc.narg(fire_at)::timestamptz IS NULL THEN 'queued' ELSE 'deferred' END,
+    sqlc.arg(priority), sqlc.narg(trigger_comment_id),
     COALESCE(sqlc.narg(coalesced_comment_ids)::uuid[], '{}'),
     sqlc.narg(trigger_summary),
     COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE),
@@ -362,6 +385,10 @@ SELECT
         WHEN COALESCE(sqlc.narg('fresh_rerun')::boolean, FALSE)
         THEN '{"fresh_rerun":true}'::jsonb
         ELSE '{}'::jsonb
+    END || CASE
+        WHEN sqlc.narg(workflow_handoff_revision)::bigint IS NOT NULL
+        THEN jsonb_build_object('workflow_handoff_revision', sqlc.narg(workflow_handoff_revision)::bigint)
+        ELSE '{}'::jsonb
     END, '{}'::jsonb),
     sqlc.narg(originator_user_id),
     sqlc.narg(accountable_user_id),
@@ -375,9 +402,10 @@ SELECT
     sqlc.narg(trigger_evidence_ref_id),
     sqlc.narg('dispatch_issue_revision')::bigint,
     -- The issue's status as this task is queued: the workflow step it works on (MUL-7420).
-    (SELECT i.status FROM issue i WHERE i.id = $3),
+    COALESCE(sqlc.narg(workflow_step)::text, (SELECT i.status FROM issue i WHERE i.id = sqlc.narg(issue_id))),
+    sqlc.narg(fire_at),
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
-WHERE lock_task_owner_rows($1, $3, $2)
+FROM enqueue_agent
 ON CONFLICT (issue_id, agent_id, dispatch_issue_revision)
     WHERE issue_id IS NOT NULL AND dispatch_issue_revision IS NOT NULL
 DO NOTHING
@@ -399,6 +427,13 @@ LIMIT 1;
 -- Channel /issue media resolves after issue creation. Persist the assigned
 -- issue task up front for crash safety, but keep it inert until attachment
 -- binding settles or the fire_at fallback is promoted by the normal sweeper.
+WITH enqueue_agent AS MATERIALIZED (
+    SELECT a.id, COALESCE(a.runtime_id, sqlc.narg(runtime_id)::uuid) AS runtime_id
+    FROM agent a
+    WHERE a.id = sqlc.arg(agent_id)
+      AND lock_task_owner_rows(a.id, sqlc.narg(issue_id), COALESCE(a.runtime_id, sqlc.narg(runtime_id)::uuid))
+    FOR KEY SHARE OF a
+)
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
@@ -408,7 +443,7 @@ INSERT INTO agent_task_queue (
     workflow_step, id
 )
 SELECT
-    $1, $2, $3, 'deferred', $4, sqlc.narg(trigger_comment_id),
+    sqlc.arg(agent_id), enqueue_agent.runtime_id, sqlc.narg(issue_id), 'deferred', sqlc.arg(priority), sqlc.narg(trigger_comment_id),
     COALESCE(sqlc.narg(coalesced_comment_ids)::uuid[], '{}'),
     sqlc.narg(trigger_summary),
     COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE),
@@ -431,9 +466,9 @@ SELECT
     sqlc.narg(trigger_evidence_ref_id),
     @fire_at,
     -- The issue's status as this task is queued: the workflow step it works on (MUL-7420).
-    (SELECT i.status FROM issue i WHERE i.id = $3),
+    (SELECT i.status FROM issue i WHERE i.id = sqlc.narg(issue_id)),
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
-WHERE lock_task_owner_rows($1, $3, $2)
+FROM enqueue_agent
 RETURNING *;
 
 -- name: PromoteDeferredChannelIssueTask :one
@@ -468,6 +503,13 @@ WHERE id = @id
 -- The requester who opened the quick-create modal is a direct_human originator
 -- and accountable; attribution provenance is stamped so this path is not a
 -- NULL-source enqueue bypass (MUL-4302 §2).
+WITH enqueue_agent AS MATERIALIZED (
+    SELECT a.id, COALESCE(a.runtime_id, sqlc.narg(runtime_id)::uuid) AS runtime_id
+    FROM agent a
+    WHERE a.id = sqlc.arg(agent_id)
+      AND lock_task_owner_rows(a.id, NULL, COALESCE(a.runtime_id, sqlc.narg(runtime_id)::uuid))
+    FOR KEY SHARE OF a
+)
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, context, originator_user_id,
     accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
@@ -475,7 +517,7 @@ INSERT INTO agent_task_queue (
     id
 )
 SELECT
-    $1, $2, NULL, 'queued', $3, $4,
+    sqlc.arg(agent_id), enqueue_agent.runtime_id, NULL, 'queued', sqlc.arg(priority), sqlc.narg(context),
     sqlc.narg(originator_user_id),
     sqlc.narg(accountable_user_id),
     sqlc.narg(runtime_mcp_overlay),
@@ -484,7 +526,7 @@ SELECT
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
-WHERE lock_task_owner_rows($1, NULL, $2)
+FROM enqueue_agent
 RETURNING *;
 
 -- name: LinkTaskToIssue :exec
@@ -507,6 +549,13 @@ WHERE id = $1 AND issue_id IS NULL
 -- identity. The child earns its own delivered-comment receipt at claim time.
 -- Preserve a NULL chat_input_task_id for legacy/channel parents rather than
 -- promoting untagged history to the task-owned input path.
+--
+-- The retry is stamped with the agent's current runtime, as an enqueue is.
+-- Claims fence on agent.runtime_id = task.runtime_id, so a retry stamped with a
+-- runtime the agent moved off while the parent ran would be claimable by neither
+-- daemon (#10717); UpdateAgent re-stamps only rows queued at switch time. An
+-- unbound agent keeps the parent's runtime. Resume needs no change here: claim
+-- resumes a session only on the runtime that recorded it.
 --
 -- Keep work_dir for every retry, but clear resume context for unsafe sessions.
 -- Keep failure predicates aligned with resumeUnsafeFailureReason and resume lookups.
@@ -531,7 +580,7 @@ INSERT INTO agent_task_queue (
     channel_context_revision, handoff_note, workflow_step, id
 )
 SELECT
-    p.agent_id, p.runtime_id, p.issue_id, p.chat_session_id, p.autopilot_run_id,
+    p.agent_id, COALESCE(a.runtime_id, p.runtime_id), p.issue_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN sqlc.narg(fire_at)::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
@@ -557,8 +606,9 @@ SELECT
     -- Named new_task_id, not id: $1 above is the PARENT task's id.
     COALESCE(sqlc.narg('new_task_id')::uuid, gen_random_uuid())
 FROM agent_task_queue p
+LEFT JOIN agent a ON a.id = p.agent_id
 WHERE p.id = $1
-  AND lock_task_owner_rows(p.agent_id, p.issue_id, p.runtime_id)
+  AND lock_task_owner_rows(p.agent_id, p.issue_id, COALESCE(a.runtime_id, p.runtime_id))
 ON CONFLICT (issue_id, agent_id, (COALESCE(comment_thread_id, '00000000-0000-0000-0000-000000000000'::uuid))) WHERE status IN ('queued', 'dispatched')
        OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
 DO NOTHING
@@ -578,7 +628,8 @@ UPDATE agent_task_queue SET workflow_step = @workflow_step WHERE id = @id;
 --
 -- The caller locks and transfers the pending issue_source_context in the same
 -- transaction. lock_task_owner_rows provides the usual workspace-teardown
--- fence; a deleted workspace therefore yields pgx.ErrNoRows and no task.
+-- fence; a deleted workspace therefore yields pgx.ErrNoRows and no task. Like
+-- CreateRetryTask, the run is stamped with the agent's current runtime (#10717).
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, status, priority, context,
     force_fresh_session, is_leader_task, squad_id,
@@ -587,18 +638,19 @@ INSERT INTO agent_task_queue (
     originator_source, rerun_of_task_id, id
 )
 SELECT
-    p.agent_id, p.runtime_id, 'queued', p.priority, p.context,
+    p.agent_id, COALESCE(a.runtime_id, p.runtime_id), 'queued', p.priority, p.context,
     TRUE, p.is_leader_task, p.squad_id,
     sqlc.arg(actor_user_id), sqlc.arg(actor_user_id),
     sqlc.narg(runtime_mcp_overlay), sqlc.narg(runtime_connected_apps),
     'direct_human', p.id, sqlc.arg(new_task_id)
 FROM agent_task_queue p
+LEFT JOIN agent a ON a.id = p.agent_id
 WHERE p.id = sqlc.arg(source_task_id)
   AND p.status = 'failed'
   AND p.issue_id IS NULL
   AND p.chat_session_id IS NULL
   AND p.autopilot_run_id IS NULL
-  AND lock_task_owner_rows(p.agent_id, p.issue_id, p.runtime_id)
+  AND lock_task_owner_rows(p.agent_id, p.issue_id, COALESCE(a.runtime_id, p.runtime_id))
 RETURNING *;
 
 -- name: DeleteUnstartedQuickCreateRetryTask :execrows
@@ -660,6 +712,32 @@ WHERE issue_id = $1 AND agent_id = $2
   AND status IN ('queued', 'dispatched', 'deferred')
   AND comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id(sqlc.narg('thread_comment_id')::uuid)
 RETURNING *;
+
+-- name: ReassignPendingAgentTasksToRuntime :one
+-- Moves an agent's not-yet-dispatched tasks to the runtime it was just rebound
+-- to. Claims fence on agent.runtime_id = task.runtime_id (MUL-6697), so a
+-- queued or deferred row left on the old runtime is claimable by neither
+-- daemon. Deferred rows move too: promotion is per runtime and would otherwise
+-- strand them later. Dispatched, running and waiting rows are already held by
+-- the old runtime's daemon and stay. Callers hold the agent row FOR UPDATE.
+--
+-- Same fence-verdict shape as ReassignTasksToRuntime: FenceOk = false must
+-- abort the rebind rather than commit a binding with stranded rows.
+WITH fence AS MATERIALIZED (
+    SELECT lock_task_owner_rows(@agent_id, NULL, @new_runtime_id) AS ok
+),
+reassigned AS (
+    UPDATE agent_task_queue
+    SET runtime_id = @new_runtime_id
+    WHERE agent_id = @agent_id
+      AND status IN ('queued', 'deferred')
+      AND runtime_id IS DISTINCT FROM @new_runtime_id
+      AND (SELECT ok FROM fence)
+    RETURNING id
+)
+SELECT
+    (SELECT ok FROM fence) AS fence_ok,
+    (SELECT count(*) FROM reassigned) AS reassigned_tasks;
 
 -- name: CancelAgentTasksByAgent :many
 -- Bulk-cancel every active (queued/dispatched/running) task for an agent.
@@ -859,17 +937,29 @@ WHERE id = @task_id
 -- queue so another poll can retry immediately instead of waiting for stale
 -- dispatch recovery. The dispatched_at CAS prevents an old handler from
 -- rolling back a newer reclaim.
-UPDATE agent_task_queue
+-- An undelivered claim follows the current binding when returned to the queue.
+-- Lock the agent before the task, as the binding transaction does.
+WITH enqueue_agent AS MATERIALIZED (
+    SELECT a.id, a.runtime_id FROM agent a
+    WHERE a.id = (SELECT agent_id FROM agent_task_queue WHERE id = @task_id)
+      AND lock_task_owner_rows(a.id, NULL, NULL)
+    FOR KEY SHARE OF a
+)
+UPDATE agent_task_queue AS task
 SET status = 'queued',
+    runtime_id = COALESCE(enqueue_agent.runtime_id, task.runtime_id),
     dispatched_at = NULL,
     prepare_lease_expires_at = NULL,
     delivered_comment_ids = '{}'
-WHERE id = @task_id
-  AND runtime_id = @runtime_id
-  AND status = 'dispatched'
-  AND started_at IS NULL
-  AND dispatched_at = @dispatched_at
-RETURNING *;
+FROM enqueue_agent
+WHERE task.id = @task_id
+  AND task.agent_id = enqueue_agent.id
+  AND task.runtime_id = @runtime_id
+  AND task.status = 'dispatched'
+  AND task.started_at IS NULL
+  AND task.dispatched_at = @dispatched_at
+  AND lock_task_owner_rows(task.agent_id, task.issue_id, COALESCE(enqueue_agent.runtime_id, task.runtime_id))
+RETURNING task.*;
 
 -- name: ReclaimStaleDispatchedTaskForRuntime :one
 -- Re-delivers a task whose previous claim likely succeeded server-side but
@@ -1063,7 +1153,10 @@ WITH retired_sessions AS (
       )
 ), latest_per_session AS (
     SELECT DISTINCT ON (t.session_id)
-        t.session_id, t.work_dir, t.runtime_id, t.status, t.failure_reason, t.error,
+        t.session_id, t.work_dir, t.runtime_id, t.status, t.failure_reason,
+        -- Counts in the adapter summary are not upstream HTTP statuses.
+        -- Keep this pattern aligned with taskfailure.WithoutCodebuddyProtocolSummary.
+        regexp_replace(COALESCE(t.error, ''), '^\[codebuddy protocol: exit_code=-?[0-9]+ stdout_bytes=[0-9]+ stderr_bytes=[0-9]+ event_count=[0-9]+ invalid_event_count=[0-9]+ assistant_event_count=[0-9]+ tool_use_count=[0-9]+ saw_result=(true|false) result_is_error=(true|false) result_bytes=[0-9]+ last_assistant_bytes=[0-9]+ scanner_error=(true|false)\]$', '', 'gn') AS error,
         t.started_at, t.issue_snapshot,
         COALESCE(t.completed_at, t.started_at, t.dispatched_at, t.created_at) AS terminal_at
     FROM agent_task_queue t
@@ -2615,8 +2708,8 @@ WHERE a.workspace_id = $1
           )
           OR (
             @mine_relation::text IN ('created', 'any')
-            AND i.creator_type = 'member'
-            AND i.creator_id = @member_id::uuid
+            AND ((i.creator_type = 'member' AND i.creator_id = @member_id::uuid)
+                 OR i.requester_user_id = @member_id::uuid)
           )
           OR (
             @mine_relation::text IN ('involved', 'any')
@@ -2687,6 +2780,26 @@ ORDER BY a.created_at ASC;
 SELECT * FROM agent_task_queue
 WHERE issue_id = $1
 ORDER BY created_at DESC;
+
+-- name: ListTasksByIssueSubtree :many
+-- UNION deduplicates IDs, so even a corrupt parent cycle terminates.
+-- Constrain every recursive step to the authorized root's workspace.
+WITH RECURSIVE subtree(id) AS (
+    SELECT root.id FROM issue root
+    WHERE root.id = sqlc.arg(root_issue_id) AND root.workspace_id = sqlc.arg(workspace_id)
+    UNION
+    SELECT child.id FROM issue child
+    JOIN subtree parent ON child.parent_issue_id = parent.id
+    WHERE child.workspace_id = sqlc.arg(workspace_id)
+)
+SELECT sqlc.embed(atq), i.title AS issue_title, i.number AS issue_number, i.number_code AS issue_number_code, w.issue_prefix
+FROM agent_task_queue atq
+JOIN subtree ON subtree.id = atq.issue_id
+JOIN issue i ON i.id = atq.issue_id
+JOIN workspace w ON w.id = i.workspace_id
+WHERE NOT sqlc.arg(active_only)::boolean
+   OR atq.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+ORDER BY atq.created_at DESC, atq.id;
 
 -- name: UpdateAgentStatus :one
 UPDATE agent SET status = $2, updated_at = now()

@@ -225,7 +225,6 @@ func (s *TaskService) DispatchIssueWithIdempotencyKey(
 			Analytics:            s.Analytics,
 			Metrics:              s.Metrics,
 			Wakeup:               s.Wakeup,
-			Entitlements:         s.Entitlements,
 			SourceContextStorage: s.SourceContextStorage,
 			FeatureFlags:         s.FeatureFlags,
 			EmptyClaim:           s.EmptyClaim,

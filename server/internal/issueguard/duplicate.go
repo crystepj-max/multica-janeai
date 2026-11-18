@@ -18,10 +18,6 @@ func NormalizeTitle(title string) string {
 	return strings.ToLower(strings.Join(strings.Fields(title), " "))
 }
 
-func DuplicateMessage(identifier, title, status string) string {
-	return "Active duplicate issue exists: " + identifier + " " + title + " (status: " + status + "). Set allow_duplicate=true or use --allow-duplicate to create another."
-}
-
 type ActiveDuplicateError struct {
 	ID         string
 	Identifier string
@@ -44,6 +40,10 @@ func NewActiveDuplicateError(issue db.Issue, issuePrefix string) *ActiveDuplicat
 		Title:      issue.Title,
 		Status:     issue.Status,
 	}
+}
+
+func DuplicateMessage(identifier, title, status string) string {
+	return "Active duplicate issue exists: " + identifier + " " + title + " (status: " + status + "). Set allow_duplicate=true or use --allow-duplicate to create another."
 }
 
 // inactiveStatusKeys are the status keys the duplicate guards never count as an

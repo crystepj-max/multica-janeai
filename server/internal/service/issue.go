@@ -5,16 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/multica-ai/multica/server/internal/attribution"
 	"log/slog"
 	"sort"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/attribution"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
-	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/issueposition"
@@ -43,9 +43,6 @@ type IssueService struct {
 	// Metrics as "PostHog only", so leaving it unset is safe.
 	Metrics     *obsmetrics.BusinessMetrics
 	TaskService *TaskService
-	// Entitlements supplies Cloud's effective issue-count instruction. Nil is
-	// the self-hosted unlimited path.
-	Entitlements entitlement.Provider
 }
 
 func NewIssueService(q *db.Queries, tx TxStarter, bus *events.Bus, ac analytics.Client, ts *TaskService) *IssueService {
@@ -89,6 +86,8 @@ type IssueCreateParams struct {
 	// used by the standalone PUT path, then inserts the complete bag atomically.
 	Properties     map[pgtype.UUID]json.RawMessage
 	AllowDuplicate bool
+	// PRAutoCompleteDisabled is persisted before the issue becomes visible.
+	PRAutoCompleteDisabled bool
 	// Stage groups this issue into an ordered barrier group under its parent
 	// (NULL = unstaged). See issue_wakeup_system.go for the staged-barrier wake.
 	Stage pgtype.Int4
@@ -159,6 +158,11 @@ var ErrParentIssueNotFound = errors.New("parent issue not found in this workspac
 // having to remember it. Callers translate this into 400.
 var ErrProjectNotFound = errors.New("project not found in this workspace")
 
+// ErrProjectArchived signals that the caller explicitly filed a new issue
+// into an archived project. Callers translate this into 409
+// project_archived; restoring the project lifts it.
+var ErrProjectArchived = errors.New("project is archived; restore it before adding issues")
+
 // ErrIssueLabelNotFound signals that one of the supplied LabelIDs does not
 // exist in the issue's workspace or is not an issue-scoped label. The whole
 // create is rejected so a new issue is never born with a partial or wrong
@@ -209,7 +213,48 @@ type IssueCreateResult struct {
 	DuplicateIssue *db.Issue
 }
 
-// Create runs the full issue-creation pipeline atomically end-to-end:
+// Create is the entry point every creator shares. It runs the pipeline below and
+// reacts to exactly one failure: a collision on uq_issue_workspace_number, which
+// proves workspace.issue_counter trails MAX(issue.number). On that collision it
+// heals the counter and runs the whole transaction again, once.
+//
+// A healthy create is byte-identical to before this existed — the allocation
+// query is untouched and nothing extra is read on the way through. The collision
+// is the signal: IncrementIssueCounter bumps the counter inside the same
+// transaction as the INSERT, so the unique violation rolls the increment back
+// too and every later create in that workspace retries the same taken number
+// forever. Moving the counter first is what makes the second attempt land on a
+// free number, and healIssueCounterAfterCollision logs the before and after so a
+// healed workspace leaves a trace instead of a silent numbering gap.
+//
+// The retry is the whole transaction, not a savepoint around the INSERT: a
+// savepoint has to be established before the statement that might fail, so every
+// successful create would pay for it too.
+func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts IssueCreateOpts) (IssueCreateResult, error) {
+	res, err := s.createOnce(ctx, p, opts)
+	if err == nil {
+		return res, nil
+	}
+	if !healIssueCounterAfterCollision(ctx, s.Queries, p.WorkspaceID, err) {
+		// Pass the result through: callers read fields alongside some of these
+		// errors, e.g. DuplicateIssue with ErrActiveDuplicate.
+		return res, err
+	}
+	res, err = s.createOnce(ctx, p, opts)
+	if err != nil {
+		var collision *IssueNumberCollisionError
+		if errors.As(err, &collision) {
+			slog.Error("issue number still collides after counter repair",
+				"workspace_id", util.UUIDToString(p.WorkspaceID),
+				"allocated", collision.Allocated,
+				"constraint", collision.Constraint)
+		}
+		return res, err
+	}
+	return res, nil
+}
+
+// createOnce runs the full issue-creation pipeline atomically end-to-end:
 //
 //  1. Begin transaction.
 //  2. Resolve & validate parent / project belong to the same workspace.
@@ -232,8 +277,7 @@ type IssueCreateResult struct {
 // MCP/API-key callers — shares the same workspace boundary semantics.
 // Caller-owned validation is limited to transport-shaped checks: title
 // required, RFC3339 date format, assignee pair sanity.
-func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts IssueCreateOpts) (IssueCreateResult, error) {
-	issueCountPolicy := ResolveIssueCountPolicy(ctx, s.Entitlements, p.WorkspaceID)
+func (s *IssueService) createOnce(ctx context.Context, p IssueCreateParams, opts IssueCreateOpts) (IssueCreateResult, error) {
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("begin tx: %w", err)
@@ -312,6 +356,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	// WorkspaceID — there is no path from this service to a row in a
 	// foreign workspace.
 	projectID := p.ProjectID
+	var parentProjectID pgtype.UUID
 	if p.ParentIssueID.Valid {
 		parent, err := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
 			ID:          p.ParentIssueID,
@@ -323,6 +368,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		// Back-fill project from parent when the caller did not pin
 		// one explicitly. Matches the long-standing HTTP behavior: a
 		// sub-issue inherits its parent's project unless overridden.
+		parentProjectID = parent.ProjectID
 		if !projectID.Valid {
 			projectID = parent.ProjectID
 		}
@@ -335,6 +381,11 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		})
 		if err != nil {
 			return IssueCreateResult{}, ErrProjectNotFound
+		}
+		// A sub-issue staying in its parent's archived project continues work
+		// already there; only filing new work into it is refused.
+		if row.ArchivedAt.Valid && projectID != parentProjectID {
+			return IssueCreateResult{}, ErrProjectArchived
 		}
 		// Legacy projects carry code = '' until their first issue lazily
 		// derives and claims one; the claim rolls back with this create if
@@ -365,7 +416,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		return IssueCreateResult{DuplicateIssue: &dup}, ErrActiveDuplicate
 	}
 
-	issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, project, issueCountPolicy)
+	issueNumber, numberCode, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, project)
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("allocate issue number: %w", err)
 	}
@@ -386,6 +437,18 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 
 	var issue db.Issue
 	var assignedTask db.AgentTaskQueue
+	// Resolve the originating human once, before the retry loop; it is
+	// independent of the (code, number) allocation that the loop varies.
+	var requester pgtype.UUID
+	if p.OriginType.Valid && p.CreatorType == "agent" && p.OriginID.Valid &&
+		(p.OriginType.String == "quick_create" || p.OriginType.String == "agent_create") {
+		requester, err = qtx.ResolveIssueRequester(ctx, db.ResolveIssueRequesterParams{
+			OriginID: p.OriginID, CreatorID: p.CreatorID, WorkspaceID: p.WorkspaceID, OriginType: p.OriginType.String,
+		})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return IssueCreateResult{}, fmt.Errorf("resolve issue requester: %w", err)
+		}
+	}
 	// A project code can outlive its project: deleting a project keeps the
 	// snapshot code on its issues, and a later project deriving the same code
 	// starts its counter at 1, so the first insert can land on a number a
@@ -394,27 +457,28 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	insertIssue := func(number int32, numberCode string) (db.Issue, error) {
 		if p.OriginType.Valid {
 			return qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
-				ID:            dbid.NewV7(),
-				WorkspaceID:   p.WorkspaceID,
-				Title:         p.Title,
-				Description:   p.Description,
-				Status:        p.Status,
-				Priority:      p.Priority,
-				AssigneeType:  p.AssigneeType,
-				AssigneeID:    p.AssigneeID,
-				CreatorType:   p.CreatorType,
-				CreatorID:     p.CreatorID,
-				ParentIssueID: p.ParentIssueID,
-				Position:      newPosition,
-				StartDate:     p.StartDate,
-				DueDate:       p.DueDate,
-				Number:        number,
-				ProjectID:     projectID,
-				NumberCode:    numberCode,
-				OriginType:    p.OriginType,
-				OriginID:      p.OriginID,
-				Stage:         p.Stage,
-				Properties:    properties,
+				ID:              dbid.NewV7(),
+				WorkspaceID:     p.WorkspaceID,
+				Title:           p.Title,
+				Description:     p.Description,
+				Status:          p.Status,
+				Priority:        p.Priority,
+				AssigneeType:    p.AssigneeType,
+				AssigneeID:      p.AssigneeID,
+				CreatorType:     p.CreatorType,
+				CreatorID:       p.CreatorID,
+				ParentIssueID:   p.ParentIssueID,
+				Position:        newPosition,
+				StartDate:       p.StartDate,
+				DueDate:         p.DueDate,
+				Number:          number,
+				ProjectID:       projectID,
+				NumberCode:      numberCode,
+				OriginType:      p.OriginType,
+				OriginID:        p.OriginID,
+				RequesterUserID: requester,
+				Stage:           p.Stage,
+				Properties:      properties,
 			})
 		}
 		return qtx.CreateIssue(ctx, db.CreateIssueParams{
@@ -455,7 +519,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		var pgErr *pgconn.PgError
 		if attempt < 50 && errors.As(err, &pgErr) && pgErr.ConstraintName == "uq_issue_workspace_code_number" {
 			_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT issue_number_attempt")
-			issueNumber, numberCode, err = AllocateIssueNumber(ctx, qtx, p.WorkspaceID, project, issueCountPolicy)
+			issueNumber, numberCode, err = AllocateIssueNumber(ctx, qtx, p.WorkspaceID, project)
 			if err != nil {
 				return IssueCreateResult{}, fmt.Errorf("allocate issue number: %w", err)
 			}
@@ -464,7 +528,19 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		if errors.As(err, &pgErr) && pgErr.ConstraintName == "issue_properties_size_limit" {
 			return IssueCreateResult{}, ErrIssuePropertiesTooLarge
 		}
-		return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
+		// Typed before it is returned so both halves can act on it: Create decides
+		// whether to heal and retry, and the transport reports a board-integrity
+		// problem instead of a generic create failure.
+		return IssueCreateResult{}, classifyIssueNumberCollision(fmt.Errorf("create issue: %w", err), issueNumber)
+	}
+
+	if p.PRAutoCompleteDisabled {
+		if err := qtx.SetIssuePRAutoCompleteDisabled(ctx, db.SetIssuePRAutoCompleteDisabledParams{
+			IssueID: issue.ID, WorkspaceID: issue.WorkspaceID, AutoCompleteDisabled: true,
+			UpdatedByType: pgtype.Text{String: p.CreatorType, Valid: true}, UpdatedByID: p.CreatorID,
+		}); err != nil {
+			return IssueCreateResult{}, fmt.Errorf("set issue PR auto-complete: %w", err)
+		}
 	}
 
 	if p.SourceContext != nil {
@@ -955,9 +1031,6 @@ func (s *IssueService) maybeEnqueueOnAssign(ctx context.Context, issue db.Issue,
 // path does the same test through agentAssigneeVerdict, which also tells it
 // WHY a refusal happened; this one runs inside the create transaction, where
 // there is nothing to tell anyone yet.
-//
-// Mirrors handler.shouldEnqueueAgentTask; kept here to make the service
-// self-contained, since both code paths must move together.
 func (s *IssueService) shouldEnqueueAgentTaskWithQueries(ctx context.Context, q *db.Queries, issue db.Issue) bool {
 	// Resolved through q, not s.Queries: this runs inside the create
 	// transaction and must see the same snapshot as the rest of it. (MUL-6243)

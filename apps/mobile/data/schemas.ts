@@ -166,6 +166,8 @@ export const ProjectSchema = z.object({
   priority: z.string(),
   lead_type: z.string().nullable(),
   lead_id: z.string().nullable(),
+  creator_type: z.string().nullable().default(null).catch(null),
+  creator_id: z.string().nullable().default(null).catch(null),
   // .default(null) so a project from an older backend that omits these keys
   // parses to null instead of degrading the batch to the empty fallback.
   start_date: z.string().nullable().default(null),
@@ -283,7 +285,7 @@ export const ChatMessageSchema: z.ZodType<ChatMessage> = z.object({
   attachments: z.array(AttachmentSchema).optional(),
   failure_reason: z.string().nullable().optional(),
   elapsed_ms: z.number().nullable().optional(),
-  message_kind: z.enum(["message", "no_response"]).catch("message").optional(),
+  message_kind: z.enum(["message", "no_response", "wakeup"]).catch("message").optional(),
   // One malformed optional suggestion must not erase an otherwise valid
   // conversation. The server validates these too; this is mixed-version and
   // corrupted-cache defense at the mobile boundary.
@@ -326,11 +328,16 @@ export const ChatPendingTaskSchema: z.ZodType<ChatPendingTask> = z.object({
 
 export const EMPTY_CHAT_PENDING_TASK: ChatPendingTask = {};
 
+// Steering fields are additive: servers before #10715 omit them and a
+// malformed value degrades to the legacy queued reading, never a failed send.
 export const SendChatMessageResponseSchema: z.ZodType<SendChatMessageResponse> = z.object({
   message_id: z.string(),
   task_id: z.string(),
   supports_queue: z.boolean().optional(),
   queued: z.boolean().optional().catch(undefined),
+  steered: z.boolean().optional().catch(undefined),
+  message_task_id: z.string().min(1).optional().catch(undefined),
+  message_created_at: z.string().min(1).optional().catch(undefined),
   created_at: z.string().default(""),
 }).loose();
 
